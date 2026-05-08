@@ -1593,7 +1593,7 @@ def main_ui():
 
     # Parse and clean
     symbols = sorted({s.strip().upper() for s in symbols_raw.split(",") if s.strip()})
-    symbols = [s for s in symbols if s not in SKIP_SYMBOLS]
+    symbols = [s for s in symbols if s and s not in SKIP_SYMBOLS]
 
     if len(symbols) > 50:
         st.sidebar.warning(f"⚠️ {len(symbols)} assets queued. This may take a minute...")
