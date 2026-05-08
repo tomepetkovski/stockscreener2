@@ -1458,6 +1458,20 @@ class Scanner:
                 })
         
         proposals_raw = await self.proposer.propose_batch(analysis_input)
+        def normalize(p):
+            if p is None:
+                return None
+        
+            if isinstance(p, dict):
+                return p
+        
+            if hasattr(p, "__dict__"):
+                return vars(p)
+        
+            return None
+        
+        proposals_raw = [normalize(p) for p in proposals_raw]
+        proposals_raw = [p for p in proposals_raw if p is not None]
         proposals = [
             p for p in proposals_raw
             if (p.edge_score if hasattr(p, "edge_score") else p.get("edge_score", 0)) >= min_edge_score
