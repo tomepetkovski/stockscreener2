@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # --- Configuration for Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("FinanceEngine")
-
+STOCKS_ALL = []
 SKIP_SYMBOLS = set()
 def fetch_and_build(symbol):
     return symbol
