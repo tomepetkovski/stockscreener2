@@ -1641,22 +1641,16 @@ def main_ui():
                 return x.get("ai_confidence", 0)
             return getattr(x, "ai_confidence", 0)
         
+        def get_confidence(x):
+            if isinstance(x, dict):
+                return x.get("ai_confidence", 0)
+            return getattr(x, "ai_confidence", 0)
+        
+        # Remove None values (safety)
+        proposals = [p for p in proposals if p is not None]
+        
+        # Single safe sort (DO NOT duplicate this anywhere else)
         proposals.sort(key=get_confidence, reverse=True)
-        # Filter by confidence
-        proposals.sort(
-            key=lambda x: getattr(x, "ai_confidence", 0),
-            reverse=True
-        )
-        proposals.sort(key=lambda x: x.ai_confidence, reverse=True)
-
-        if errors:
-            with st.expander(f"⚠️ {len(errors)} errors (click to expand)", expanded=False):
-                for e in errors[:20]:
-                    st.text(e)
-
-        if not proposals:
-            st.error(f"No setups found above {min_confidence}% confidence out of {len(symbols)} scanned.")
-            return
 
         st.success(f"🎯 Found **{len(proposals)}** qualifying setups out of **{len(symbols)}** scanned.")
 
