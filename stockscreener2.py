@@ -1660,7 +1660,7 @@ def main_ui():
         summary_data = []
         for p in proposals:
             summary_data.append({
-                "Symbol": p.symbol,
+                "Symbol": getattr(p, "symbol", p.get("symbol", "UNKNOWN") if isinstance(p, dict) else "UNKNOWN"),
                 "Setup": p.setup_type,
                 "Direction": p.direction,
                 "Confidence": f"{p.ai_confidence}%",
