@@ -18,6 +18,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("FinanceEngine")
 
 SKIP_SYMBOLS = set()
+def fetch_and_build(symbol):
+    return symbol
 # ===============================================
 # 1. TECHNICAL INDICATORS
 # ===============================================
