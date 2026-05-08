@@ -1657,22 +1657,28 @@ def main_ui():
         # --- Summary Table ---
         st.subheader("📊 Setup Summary")
 
+        def get_field(p, key, default="UNKNOWN"):
+            if isinstance(p, dict):
+                return p.get(key, default)
+            return getattr(p, key, default)
+        
         summary_data = []
+        
         for p in proposals:
             summary_data.append({
-                "Symbol": getattr(p, "symbol", p.get("symbol", "UNKNOWN") if isinstance(p, dict) else "UNKNOWN"),
-                "Setup": getattr(p, "setup_type", p.get("setup_type", "UNKNOWN") if isinstance(p, dict) else "UNKNOWN"),
-                "Direction": p.direction,
-                "Confidence": f"{p.ai_confidence}%",
-                "Grade": p.ai_grade,
-                "Entry": p.entry_price,
-                "Stop Loss": p.stop_loss,
-                "TP1": p.tp_1,
-                "TP2": p.tp_2,
-                "R:R": f"1:{p.risk_reward}",
-                "Size%": f"{p.position_size_pct}%",
+                "Symbol": get_field(p, "symbol"),
+                "Setup": get_field(p, "setup_type"),
+                "Direction": get_field(p, "direction"),
+                "Confidence": f"{get_field(p, 'ai_confidence', 0)}%",
+                "Grade": get_field(p, "ai_grade"),
+                "Entry": get_field(p, "entry_price"),
+                "Stop Loss": get_field(p, "stop_loss"),
+                "TP1": get_field(p, "tp_1"),
+                "TP2": get_field(p, "tp_2"),
+                "R:R": f"1:{get_field(p, 'risk_reward', 0)}",
+                "Size%": f"{get_field(p, 'position_size_pct', 0)}%",
             })
-
+        
         df_summary = pd.DataFrame(summary_data)
 
         # Style
