@@ -3073,7 +3073,7 @@ def main_ui():
     st.set_page_config(layout="wide", page_title="Institutional Breakout Terminal v4")
 
     st.title("🚀 Institutional Breakout & Investment Terminal")
-    st.caption("3–12 Month Investment Opportunity Scanner | Multi-Timeframe | Market Regime Aware")
+    st.caption("3–12 Month Investment Opportunity Scanner | Multi-Timeframe | Market Regime Aware. Tnx to Kicko Ognenovski, Nikola Stojcevski, Altaj Sulejman, Dejan Butevski, Anastas Dzurovski")
 
     # =========================================================
     # SIDEBAR CONFIG
