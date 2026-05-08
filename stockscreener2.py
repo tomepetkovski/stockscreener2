@@ -1661,7 +1661,7 @@ def main_ui():
         for p in proposals:
             summary_data.append({
                 "Symbol": getattr(p, "symbol", p.get("symbol", "UNKNOWN") if isinstance(p, dict) else "UNKNOWN"),
-                "Setup": p.setup_type,
+                "Setup": getattr(p, "setup_type", p.get("setup_type", "UNKNOWN") if isinstance(p, dict) else "UNKNOWN"),
                 "Direction": p.direction,
                 "Confidence": f"{p.ai_confidence}%",
                 "Grade": p.ai_grade,
