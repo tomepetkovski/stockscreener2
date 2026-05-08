@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass
 from pathlib import Path
-
+from concurrent.futures import ThreadPoolExecutor
 # --- Configuration for Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("FinanceEngine")
