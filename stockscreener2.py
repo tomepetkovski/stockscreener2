@@ -1,7 +1,7 @@
 """
 Institutional Breakout & Investment Terminal v4.0
-Enhanced for 3-12 month investment opportunity detection.
-thanks to Kicko Ognenovski, Nikola Stojcevski, Altj Sulejman, Dejan Butevski, Anastas Dzurovski
+Enhanced for 3-12 month investment opportunity detection, thanks to Kicko Ognenovski, Nikola Stojcevski, Altj Sulejman, Dejan Butevski, Anastas Dzurovski
+
 
 Features:
   - Market Regime Detection (Bull/Bear/Range via SPY/QQQ/VIX)
