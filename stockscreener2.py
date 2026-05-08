@@ -1638,10 +1638,10 @@ def main_ui():
         progress_bar.empty()
 
         # Filter by confidence
-        proposals = [
-            p for p in proposals
-            if getattr(p, "ai_confidence", 0) >= min_confidence
-        ]
+        proposals.sort(
+            key=lambda x: getattr(x, "ai_confidence", 0),
+            reverse=True
+        )
         proposals.sort(key=lambda x: x.ai_confidence, reverse=True)
 
         if errors:
