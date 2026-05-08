@@ -1636,7 +1636,12 @@ def main_ui():
                     errors.append(f"{sym}: {str(e)[:60]}")
 
         progress_bar.empty()
-
+        def get_confidence(x):
+            if isinstance(x, dict):
+                return x.get("ai_confidence", 0)
+            return getattr(x, "ai_confidence", 0)
+        
+        proposals.sort(key=get_confidence, reverse=True)
         # Filter by confidence
         proposals.sort(
             key=lambda x: getattr(x, "ai_confidence", 0),
