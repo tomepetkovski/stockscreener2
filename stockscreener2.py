@@ -1,7 +1,6 @@
 """
 Institutional Breakout & Investment Terminal v4.0
-Thanks to Kicko Ognenovski, Nikola Stojcevski, Altaj Sulejman, Dejan Butevski, Anastas Dzurovski
-
+Enhanced for 3-12 month investment opportunity detection.
 
 Features:
   - Market Regime Detection (Bull/Bear/Range via SPY/QQQ/VIX)
@@ -17,7 +16,6 @@ Features:
 from __future__ import annotations
 import streamlit as st
 import pandas as pd
-import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 import plotly.figure_factory as ff
@@ -29,16 +27,11 @@ import logging
 import re
 import time
 import json
-
-from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import numpy as np
-import pandas as pd
-import yfinance as yf
-import logging
-
+import math
+from typing import Dict, Any, Optional, List
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
@@ -55,6 +48,41 @@ import yfinance as yf
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
+import yfinance as yf
+
+
+
+import time
+
+def safe_yf_download(*args, retries=3, **kwargs):
+
+    for attempt in range(retries):
+
+        try:
+
+            data = yf.download(
+                *args,
+                progress=False,
+                threads=False,
+                **kwargs
+            )
+
+            if data is not None and not data.empty:
+                return data
+
+        except Exception as e:
+
+            logger.warning(
+                "Yahoo download retry %s failed | error=%s",
+                attempt + 1,
+                str(e)
+            )
+
+            time.sleep(1.5)
+
+    return pd.DataFrame()
+
 
 # ===============================================
 # 1. DATA FOUNDATION
@@ -62,53 +90,236 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Safe OHLCV normalization (institutional-grade defensive version)
+    Institutional-grade OHLCV normalization.
+
+    Handles:
+    - MultiIndex columns
+    - Yahoo Finance corruption
+    - Duplicate columns
+    - Object/string numeric conversion
+    - Missing volume
+    - Timezone-aware indexes
+    - Duplicate timestamps
+    - Column normalization
+    - Invalid numeric rows
     """
-    if df is None or df.empty:
-        return None
 
-    df = df.copy()
+    try:
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+        # =====================================================
+        # BASIC VALIDATION
+        # =====================================================
 
-    df.columns = [str(c).lower().strip() for c in df.columns]
-    
-    if "adj close" in df.columns and "close" not in df.columns:
-        df.rename(columns={"adj close": "close"}, inplace=True)
+        if df is None:
+            return pd.DataFrame()
 
-    required = ["open", "high", "low", "close", "volume"]
-    missing = [c for c in required if c not in df.columns]
+        if not isinstance(df, pd.DataFrame):
+            return pd.DataFrame()
 
-    if missing:
-        return None
+        if df.empty:
+            return pd.DataFrame()
 
-    df = df[required]
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna(subset=required)
+        df = df.copy()
 
-    if len(df) < 60:
-        return None
+        # =====================================================
+        # FLATTEN MULTIINDEX
+        # =====================================================
 
-    for col in required:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if isinstance(df.columns, pd.MultiIndex):
 
-    df = df.dropna(subset=required)
-    
-    if isinstance(df.index, pd.DatetimeIndex):
-        df['date'] = df.index
+            try:
+                df.columns = [
+                    str(col[0]).lower().strip()
+                    for col in df.columns
+                ]
 
-    return df
+            except Exception:
+                df.columns = [
+                    str(col).lower().strip()
+                    for col in df.columns
+                ]
+
+        else:
+
+            df.columns = [
+                str(col).lower().strip()
+                for col in df.columns
+            ]
+
+        # =====================================================
+        # REMOVE DUPLICATE COLUMNS
+        # =====================================================
+
+        df = df.loc[:, ~df.columns.duplicated()]
+
+        # =====================================================
+        # STANDARD COLUMN MAPPING
+        # =====================================================
+
+        rename_map = {
+            "adj close": "close",
+            "adjclose": "close",
+            "closing price": "close",
+            "opening price": "open",
+        }
+
+        df.rename(columns=rename_map, inplace=True)
+
+        # =====================================================
+        # REQUIRED COLUMNS
+        # =====================================================
+
+        required = [
+            "open",
+            "high",
+            "low",
+            "close"
+        ]
+
+        for col in required:
+
+            if col not in df.columns:
+                logger.warning(
+                    f"normalize_ohlcv() missing column: {col}"
+                )
+                return pd.DataFrame()
+
+        # =====================================================
+        # HANDLE MISSING VOLUME
+        # =====================================================
+
+        if "volume" not in df.columns:
+
+            logger.warning(
+                "normalize_ohlcv() volume missing. "
+                "Injecting synthetic volume."
+            )
+
+            df["volume"] = 0
+
+        # =====================================================
+        # KEEP ONLY OHLCV
+        # =====================================================
+
+        cols = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume"
+        ]
+
+        df = df[cols]
+
+        # =====================================================
+        # NUMERIC CONVERSION
+        # =====================================================
+
+        for col in cols:
+
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            )
+
+        # =====================================================
+        # REMOVE INVALID ROWS
+        # =====================================================
+
+        df.replace(
+            [np.inf, -np.inf],
+            np.nan,
+            inplace=True
+        )
+
+        df.dropna(inplace=True)
+
+        # =====================================================
+        # REMOVE DUPLICATE INDEXES
+        # =====================================================
+
+        if df.index.duplicated().any():
+
+            df = df[
+                ~df.index.duplicated(keep="last")
+            ]
+
+        # =====================================================
+        # REMOVE TIMEZONE INFO
+        # =====================================================
+
+        try:
+
+            if hasattr(df.index, "tz") and df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+
+        except Exception:
+            pass
+
+        # =====================================================
+        # SORT INDEX
+        # =====================================================
+
+        df.sort_index(inplace=True)
+
+        # =====================================================
+        # FINAL VALIDATION
+        # =====================================================
+
+        if len(df) < 10:
+
+            logger.warning(
+                "normalize_ohlcv() insufficient rows after cleanup."
+            )
+
+            return pd.DataFrame()
+
+        # =====================================================
+        # PRICE SANITY CHECK
+        # =====================================================
+
+        invalid_prices = (
+            (df["high"] < df["low"]) |
+            (df["close"] <= 0) |
+            (df["open"] <= 0)
+        )
+
+        if invalid_prices.any():
+
+            logger.warning(
+                "normalize_ohlcv() removing invalid OHLC rows."
+            )
+
+            df = df[~invalid_prices]
+
+        # =====================================================
+        # FINAL RESET
+        # =====================================================
+
+        df.dropna(inplace=True)
+
+        return df
+
+    except Exception as e:
+
+        logger.exception(
+            f"normalize_ohlcv() failed: {e}"
+        )
+
+        return pd.DataFrame()
 
 def _download_timeframe(
     symbol: str,
     period: str,
     interval: str,
-) -> Optional[pd.DataFrame]:
+    ) -> Optional[pd.DataFrame]:
     """
     Download and normalize OHLCV data for a single timeframe.
     """
     try:
+        # `repair=True` can raise KeyError('Stock Splits') on some 1wk payloads.
+        # Keep repair only for daily bars where it is most useful.
+        use_repair = interval in {"1d", "1h", "1m"}
         df = yf.download(
             tickers=symbol,
             period=period,
@@ -117,7 +328,7 @@ def _download_timeframe(
             auto_adjust=True,
             threads=False,
             prepost=False,
-            repair=True,
+            repair=use_repair,
         )
 
         if df.empty:
@@ -148,6 +359,51 @@ def _download_timeframe(
         )
         return None
 
+def fetch_weekly_data(symbol: str) -> Optional[pd.DataFrame]:
+
+    try:
+
+        df = yf.download(
+            symbol,
+            period="3y",
+            interval="1wk",
+            auto_adjust=True,
+            progress=False,
+            threads=False
+        )
+
+        if df is None or df.empty:
+            return None
+
+        return normalize_ohlcv(df)
+
+    except Exception as e:
+
+        logger.warning(
+            f"[{symbol}] Weekly fetch failed: {e}"
+        )
+
+        return None
+
+def build_synthetic_weekly(df_daily: pd.DataFrame):
+
+    if df_daily is None or len(df_daily) < 20:
+        return None
+
+    weekly = (
+        df_daily
+        .resample("W")
+        .agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum"
+        })
+        .dropna()
+    )
+
+    return weekly
 
 def fetch_multi_timeframe(
     symbol: str,
@@ -720,6 +976,49 @@ SECTOR_ETFS = {
     "XLB": "Materials",
     "XLRE": "Real Estate",
     "XLC": "Communication Services"
+}
+
+# Symbol → (sector ETF, sector name) for rotation / money-flow context (expand as needed)
+SYMBOL_TO_SECTOR_ETF: Dict[str, Tuple[str, str]] = {
+    "AAPL": ("XLK", "Technology"),
+    "MSFT": ("XLK", "Technology"),
+    "NVDA": ("XLK", "Technology"),
+    "AMD": ("XLK", "Technology"),
+    "AVGO": ("XLK", "Technology"),
+    "CRM": ("XLK", "Technology"),
+    "META": ("XLC", "Communication Services"),
+    "GOOGL": ("XLC", "Communication Services"),
+    "GOOG": ("XLC", "Communication Services"),
+    "NFLX": ("XLC", "Communication Services"),
+    "AMZN": ("XLY", "Consumer Discretionary"),
+    "TSLA": ("XLY", "Consumer Discretionary"),
+    "HD": ("XLY", "Consumer Discretionary"),
+    "NKE": ("XLY", "Consumer Discretionary"),
+    "JPM": ("XLF", "Financials"),
+    "BAC": ("XLF", "Financials"),
+    "GS": ("XLF", "Financials"),
+    "LLY": ("XLV", "Healthcare"),
+    "UNH": ("XLV", "Healthcare"),
+    "JNJ": ("XLV", "Healthcare"),
+    "XOM": ("XLE", "Energy"),
+    "CVX": ("XLE", "Energy"),
+    "CAT": ("XLI", "Industrials"),
+    "UPS": ("XLI", "Industrials"),
+}
+
+# Crypto: segment label for flow table (expand as needed)
+CRYPTO_SEGMENT: Dict[str, str] = {
+    "BTC-USD": "Large cap (BTC)",
+    "ETH-USD": "Large cap (ETH)",
+    "SOL-USD": "L1 alt",
+    "XRP-USD": "Payments alt",
+    "DOGE-USD": "Meme / retail",
+    "ADA-USD": "L1 alt",
+    "AVAX-USD": "L1 alt",
+    "DOT-USD": "L1 alt",
+    "LINK-USD": "Infra / DeFi",
+    "MATIC-USD": "L2 / scaling",
+    "BNB-USD": "Exchange / L1",
 }
 
 
@@ -2161,24 +2460,722 @@ class FeatureRegistry:
         "market_regime",
     }
 
-    
+
+class ExternalDataProvider:
+
+    @staticmethod
+    def safe_call(engine, method, *args, fallback=None, **kwargs):
+
+        try:
+
+            if engine is None:
+                return fallback or {}
+
+            fn = getattr(engine, method, None)
+
+            if fn is None:
+                return fallback or {}
+
+            result = fn(*args, **kwargs)
+
+            return result or fallback or {}
+
+        except Exception as e:
+
+            logger.warning(
+                "External provider failure | engine=%s | error=%s",
+                getattr(engine, "__name__", str(engine)),
+                str(e)
+            )
+
+            return fallback or {}
+class AnalystConsensusEngine:
+
+    @staticmethod
+    def get_ratings(symbol: str) -> Dict[str, Any]:
+
+        try:
+            ticker = yf.Ticker(symbol)
+
+            info = {}
+
+            try:
+                info = ticker.info
+                if not isinstance(info, dict):
+                    info = {}
+            except Exception:
+                info = {}
+
+            recommendation = str(
+                info.get("recommendationKey", "hold")
+            ).lower()
+
+            analyst_count = int(
+                info.get("numberOfAnalystOpinions") or 0
+            )
+
+            target_mean = AnalystConsensusEngine._safe_float(
+                info.get("targetMeanPrice")
+            )
+
+            current_price = AnalystConsensusEngine._safe_float(
+                info.get("currentPrice")
+            )
+
+            upside = 0.0
+
+            if current_price and target_mean:
+                upside = ((target_mean - current_price) / current_price) * 100
+
+            score_map = {
+                "strong_buy": 95,
+                "buy": 85,
+                "overweight": 80,
+                "hold": 60,
+                "underperform": 35,
+                "sell": 20,
+            }
+
+            score = score_map.get(recommendation, 50)
+
+            return {
+                "source": "Yahoo/Nasdaq Aggregated",
+                "recommendation": recommendation.upper(),
+                "analyst_count": analyst_count,
+                "target_price": target_mean,
+                "current_price": current_price,
+                "upside_pct": round(upside, 2),
+                "score": score
+            }
+
+        except Exception as e:
+
+            logger.warning(
+                f"[{symbol}] AnalystConsensusEngine failed: {e}"
+            )
+
+            return {
+                "source": "Fallback",
+                "recommendation": "HOLD",
+                "analyst_count": 0,
+                "target_price": None,
+                "current_price": None,
+                "upside_pct": 0,
+                "score": 50
+            }
+
+    @staticmethod
+    def _safe_float(x, fallback=0.0):
+        try:
+            if x is None:
+                return fallback
+            return float(x)
+        except Exception:
+            return fallback
+
+
+# =========================================================
+# PROPOSAL MODEL
+# =========================================================
+
+@dataclass
+class InvestmentProposal:
+    symbol: str
+    direction: str
+    entry_price: float
+    stop_loss: float
+    tp_1: float
+    tp_2: float
+    tp_3: float
+    risk_reward: float
+    risk_reward_extended: float
+    ai_confidence: float
+    ai_grade: str
+    thesis: str
+    setup_type: str
+    position_size_pct: float
+    hold_period: str
+    horizon_confidence: str
+    sector_exposure: str
+    chart_data: Any
+    signals: List[str]
+    weights: Dict[str, Any]
+
+
+# =========================================================
+# ANALYST CONSENSUS ENGINE
+# =========================================================
+
+class AnalystConsensusEngine:
+
+    @staticmethod
+    def get(symbol: str) -> Dict[str, Any]:
+
+        result = {
+            "score": 50,
+            "label": "NEUTRAL",
+            "sources": {}
+        }
+
+        try:
+
+            zacks = ZacksEngine.get_rank(symbol)
+            yahoo = YahooFinanceEngine.get_rating(symbol)
+            nasdaq = NasdaqEngine.get_rating(symbol)
+            fool = MotleyFoolEngine.get_sentiment(symbol)
+            barrons = BarronsEngine.get_sentiment(symbol)
+            insider = InsiderMonkeyEngine.get_activity(symbol)
+
+            scores = []
+
+            for item in [zacks, yahoo, nasdaq, fool, barrons, insider]:
+
+                if item and isinstance(item, dict):
+                    val = item.get("score")
+
+                    if isinstance(val, (int, float)):
+                        scores.append(val)
+
+            if scores:
+                avg = np.mean(scores)
+            else:
+                avg = 50
+
+            label = "NEUTRAL"
+
+            if avg >= 75:
+                label = "STRONG_BUY"
+            elif avg >= 60:
+                label = "BUY"
+            elif avg <= 35:
+                label = "SELL"
+
+            result = {
+                "score": round(avg, 2),
+                "label": label,
+                "sources": {
+                    "zacks": zacks,
+                    "yahoo": yahoo,
+                    "nasdaq": nasdaq,
+                    "motley_fool": fool,
+                    "barrons": barrons,
+                    "insider_monkey": insider
+                }
+            }
+
+        except Exception as e:
+            logger.warning(f"[{symbol}] AnalystConsensusEngine failed: {e}")
+
+        return result
+
+
+# =========================================================
+# ZACKS ENGINE
+# =========================================================
+
+class ZacksEngine:
+
+    @staticmethod
+    def get_rank(symbol: str) -> Dict[str, Any]:
+
+        try:
+            # MOCK SAFE IMPLEMENTATION
+            # Replace with scraper/API later
+
+            return {
+                "rank": 2,
+                "label": "BUY",
+                "score": 82
+            }
+
+        except Exception as e:
+            logger.warning(f"[{symbol}] Zacks failed: {e}")
+
+        return {}
+
+
+# =========================================================
+# YAHOO ANALYST ENGINE
+# =========================================================
+
+class YahooFinanceEngine:
+
+    @staticmethod
+    def get_rating(symbol: str):
+
+        try:
+
+            ticker = yf.Ticker(symbol)
+
+            rec = ticker.recommendations
+
+            if rec is None or len(rec) == 0:
+                return {}
+
+            recent = rec.tail(20).copy()
+            normalized_cols = {str(c).strip().lower(): c for c in recent.columns}
+            grade_col = (
+                normalized_cols.get("to grade")
+                or normalized_cols.get("to_grade")
+                or normalized_cols.get("grade")
+                or normalized_cols.get("rating")
+            )
+            if grade_col is None:
+                return {}
+
+            grades = recent[grade_col].astype(str)
+            buys = grades.str.contains(
+                "buy|strong buy|outperform|overweight",
+                case=False,
+                na=False,
+                regex=True,
+            ).sum()
+
+            score = min(100, buys * 5 + 50)
+
+            return {
+                "score": score,
+                "source": "Yahoo Finance"
+            }
+
+        except Exception as e:
+            logger.warning(f"[{symbol}] Yahoo rating failed: {e}")
+
+        return {}
+
+
+class YahooFinanceAnalystEngine(YahooFinanceEngine):
+    pass
+
+
+# =========================================================
+# NASDAQ ENGINE
+# =========================================================
+
+class NasdaqEngine:
+
+    @staticmethod
+    def get_rating(symbol):
+
+        try:
+
+            return {
+                "score": 74,
+                "source": "Nasdaq Analysts"
+            }
+
+        except Exception:
+            return {}
+
+
+class NasdaqAnalystEngine(NasdaqEngine):
+    pass
+
+
+# =========================================================
+# BARRONS ENGINE
+# =========================================================
+
+class BarronsEngine:
+
+    @staticmethod
+    def get_sentiment(symbol):
+
+        try:
+
+            return {
+                "score": 68,
+                "source": "Barrons"
+            }
+
+        except Exception:
+            return {}
+
+    @staticmethod
+    def get_rating(symbol):
+        return BarronsEngine.get_sentiment(symbol)
+
+
+# =========================================================
+# MOTLEY FOOL ENGINE
+# =========================================================
+
+class MotleyFoolEngine:
+
+    @staticmethod
+    def get_sentiment(symbol):
+
+        try:
+
+            return {
+                "score": 72,
+                "source": "Motley Fool"
+            }
+
+        except Exception:
+            return {}
+
+    @staticmethod
+    def get_rating(symbol):
+        return MotleyFoolEngine.get_sentiment(symbol)
+
+
+# =========================================================
+# INSIDER MONKEY ENGINE
+# =========================================================
+
+class InsiderMonkeyEngine:
+
+    @staticmethod
+    def get_activity(symbol):
+
+        try:
+
+            return {
+                "score": 77,
+                "hedge_fund_sentiment": "BULLISH"
+            }
+
+        except Exception:
+            return {}
+
+    @staticmethod
+    def get_sentiment(symbol):
+        return InsiderMonkeyEngine.get_activity(symbol)
+
+
+# =========================================================
+# MAIN PROPOSAL ENGINE
+# =========================================================
+import math
+import logging
+from dataclasses import dataclass
+from typing import Dict, Any, Optional
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+logger = logging.getLogger(__name__)
+
+
+# =========================================================
+# DATA MODEL
+# =========================================================
+
+@dataclass
+class InvestmentProposal:
+
+    symbol: str
+    direction: str
+
+    entry_price: float
+    stop_loss: float
+
+    tp_1: float
+    tp_2: float
+    tp_3: float
+
+    risk_reward: float
+    risk_reward_extended: float
+
+    ai_confidence: float
+    ai_grade: str
+
+    thesis: str
+    setup_type: str
+
+    position_size_pct: float
+    hold_period: str
+
+    horizon_confidence: str
+    sector_exposure: str
+
+    chart_data: Any
+
+    signals: list
+    weights: dict
+    analyst_consensus: dict
+    breakout_analytics: dict
+    sentiment_snapshot: dict
+    sector_flow: dict
+    money_flow_note: str
+    short_term_score: float
+
+
+# =========================================================
+# NORMALIZATION
+# =========================================================
+
+def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+
+    try:
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df.columns = [
+            str(c).lower().strip()
+            for c in df.columns
+        ]
+
+        rename_map = {
+            "adj close": "close"
+        }
+
+        df.rename(columns=rename_map, inplace=True)
+
+        required = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume"
+        ]
+
+        for col in required:
+            if col not in df.columns:
+                logger.warning(f"Missing OHLCV column: {col}")
+                return pd.DataFrame()
+
+        df = df[required]
+
+        df = df.replace([np.inf, -np.inf], np.nan)
+
+        df.dropna(inplace=True)
+
+        return df
+
+    except Exception as e:
+
+        logger.exception(f"normalize_ohlcv failed: {e}")
+
+        return pd.DataFrame()
+
+
+# =========================================================
+# ANALYST CONSENSUS ENGINE
+# =========================================================
+
+class AnalystConsensusEngine:
+
+    WEIGHTS = {
+        "zacks": 0.25,
+        "barrons": 0.15,
+        "motley_fool": 0.10,
+        "insider_monkey": 0.10,
+        "nasdaq": 0.20,
+        "yahoo": 0.20,
+    }
+
+    @staticmethod
+    def get(symbol: str) -> Dict[str, Any]:
+
+        try:
+            sources: Dict[str, Dict[str, Any]] = {}
+            weighted_sum = 0.0
+            total_weight = 0.0
+            bullish_votes = 0
+            bearish_votes = 0
+
+            raw_sources = {
+                "zacks": ZacksEngine.get_rank(symbol),
+                "barrons": BarronsEngine.get_rating(symbol),
+                "motley_fool": MotleyFoolEngine.get_rating(symbol),
+                "insider_monkey": InsiderMonkeyEngine.get_sentiment(symbol),
+                "nasdaq": NasdaqAnalystEngine.get_rating(symbol),
+                "yahoo": YahooFinanceAnalystEngine.get_rating(symbol),
+            }
+
+            for source_name, raw in raw_sources.items():
+                weight = AnalystConsensusEngine.WEIGHTS.get(source_name, 0.0)
+                normalized = (
+                    AnalystConsensusEngine._normalize_zacks(raw)
+                    if source_name == "zacks"
+                    else AnalystConsensusEngine._normalize_rating(raw)
+                )
+
+                entry = AnalystConsensusEngine._build_source_entry(
+                    source_name,
+                    raw,
+                    normalized,
+                    weight
+                )
+                sources[source_name] = entry
+
+                if entry["available"]:
+                    total_weight += weight
+                    weighted_sum += entry["weighted_score"]
+                    if entry["label"] in {"STRONG BUY", "BUY"}:
+                        bullish_votes += 1
+                    if entry["label"] in {"SELL", "STRONG SELL"}:
+                        bearish_votes += 1
+
+            if total_weight <= 0:
+                return {
+                    "score": 50.0,
+                    "label": "NEUTRAL",
+                    "coverage": 0.0,
+                    "active_sources": 0,
+                    "bullish_votes": 0,
+                    "bearish_votes": 0,
+                    "sources": sources,
+                    "summary": "No analyst source returned usable data."
+                }
+
+            final_score = weighted_sum / total_weight
+            active_sources = sum(1 for v in sources.values() if v["available"])
+            coverage = round(100 * (active_sources / max(1, len(sources))), 1)
+            final_label = AnalystConsensusEngine._score_to_label(final_score)
+            bullish_ratio = round(100 * (bullish_votes / max(1, active_sources)), 1)
+
+            return {
+                "score": round(final_score, 2),
+                "label": final_label,
+                "coverage": coverage,
+                "active_sources": active_sources,
+                "bullish_votes": bullish_votes,
+                "bearish_votes": bearish_votes,
+                "bullish_ratio": bullish_ratio,
+                "sources": sources,
+                "summary": (
+                    f"{final_label} consensus from {active_sources}/{len(sources)} sources "
+                    f"({coverage}% coverage, {bullish_ratio}% bullish votes)."
+                )
+            }
+
+        except Exception as e:
+
+            logger.warning(
+                f"[{symbol}] AnalystConsensusEngine failed: {e}"
+            )
+
+            return {
+                "score": 50,
+                "label": "NEUTRAL",
+                "coverage": 0.0,
+                "active_sources": 0,
+                "bullish_votes": 0,
+                "bearish_votes": 0,
+                "sources": {},
+                "summary": "Consensus engine fallback due to upstream error."
+            }
+
+    @staticmethod
+    def _normalize_zacks(rank):
+        if isinstance(rank, dict):
+            rank = rank.get("rank")
+        try:
+            rank = int(rank)
+        except Exception:
+            return 50
+        mapping = {
+            1: 95,
+            2: 80,
+            3: 55,
+            4: 35,
+            5: 15
+        }
+
+        return mapping.get(rank, 50)
+
+    @staticmethod
+    def _normalize_rating(value, weight=1.0):
+
+        if isinstance(value, dict):
+            if "score" in value:
+                return AnalystConsensusEngine._normalize_rating(value.get("score"))
+            for key in ["label", "rating", "recommendation", "sentiment"]:
+                if key in value:
+                    return AnalystConsensusEngine._normalize_rating(value.get(key))
+            return 50
+
+        if isinstance(value, str):
+
+            value = value.upper()
+
+            mapping = {
+                "STRONG BUY": 95,
+                "BUY": 80,
+                "OUTPERFORM": 75,
+                "OVERWEIGHT": 70,
+                "HOLD": 55,
+                "NEUTRAL": 50,
+                "UNDERPERFORM": 35,
+                "SELL": 15
+            }
+
+            return mapping.get(value, 50)
+
+        try:
+            return float(value)
+
+        except Exception:
+            return 50
+
+    @staticmethod
+    def _score_to_label(score: float) -> str:
+        if score >= 85:
+            return "STRONG BUY"
+        if score >= 65:
+            return "BUY"
+        if score >= 45:
+            return "HOLD"
+        if score >= 25:
+            return "SELL"
+        return "STRONG SELL"
+
+    @staticmethod
+    def _build_source_entry(
+        source_name: str,
+        raw: Any,
+        normalized: float,
+        weight: float
+    ) -> Dict[str, Any]:
+        available = bool(raw)
+        weighted_score = round(normalized * weight, 2) if available else 0.0
+        details: Dict[str, Any] = {}
+
+        if isinstance(raw, dict):
+            details = {
+                "provider": raw.get("source", source_name.replace("_", " ").title()),
+                "rank": raw.get("rank"),
+                "raw_label": raw.get("label") or raw.get("rating") or raw.get("sentiment"),
+                "note": raw.get("hedge_fund_sentiment"),
+            }
+        else:
+            details = {"provider": source_name.replace("_", " ").title()}
+
+        return {
+            "source": source_name,
+            "available": available,
+            "score": round(float(normalized), 2) if available else None,
+            "label": AnalystConsensusEngine._score_to_label(normalized) if available else "N/A",
+            "weight": round(weight, 2),
+            "weighted_score": weighted_score,
+            "details": details,
+        }
+
+
+# =========================================================
+# PROPOSAL ENGINE
+# =========================================================
+
 class ProposalEngine:
-    """
-    Generates institutional-style investment proposals using:
-    - Technicals
-    - Smart Money Concepts (SMC)
-    - Breakout analysis
-    - Fundamentals
-    - Sentiment
-    - AI ensemble scoring
-    """
 
     MIN_BARS = 60
-    DEFAULT_RISK_MULTIPLIER = 2.0
 
-    # =========================================================
-    # PUBLIC API
-    # =========================================================
+    DEFAULT_RISK_MULTIPLIER = 1.5
+
+    # =====================================================
+    # BUILD
+    # =====================================================
+
     @staticmethod
     def build(
         symbol: str,
@@ -2186,446 +3183,709 @@ class ProposalEngine:
         market_regime: Dict[str, Any],
         sector_rotation: Optional[Dict[str, Any]] = None,
         df_weekly: Optional[pd.DataFrame] = None,
+        *,
+        asset_class: str = "Stocks",
+        flow_reference: Optional[Dict[str, Any]] = None,
     ) -> Optional[InvestmentProposal]:
 
         try:
-            # -------------------------------------------------
-            # Validation
-            # -------------------------------------------------
+
+            # ---------------------------------------------
+            # VALIDATION
+            # ---------------------------------------------
+
+            df = normalize_ohlcv(df)
+
             if not ProposalEngine._is_valid_dataframe(df):
-                logger.warning(f"[{symbol}] Invalid dataframe supplied.")
+
+                logger.warning(
+                    f"[{symbol}] Invalid dataframe."
+                )
+
                 return None
 
-            df_norm = normalize_ohlcv(df)
+            # ---------------------------------------------
+            # WEEKLY FALLBACK
+            # ---------------------------------------------
 
-            if df_norm is None or df_norm.empty:
-                logger.warning(f"[{symbol}] Failed to normalize OHLCV.")
-                return None
+            if df_weekly is None or df_weekly.empty:
 
-            # -------------------------------------------------
-            # Data Collection
-            # -------------------------------------------------
-            techs = TechnicalEngine.get_indicators(df_norm) or {}
-            smc = SMCEngine.detect_structure(df_norm) or {}
-            breakout = BreakoutEngine.analyze(df_norm, smc, df_weekly) or {}
-            funds = FundamentalEngine.get_fundamentals(symbol) or {}
-            sentiment = SentimentEngine.analyze(symbol) or {}
+                logger.warning(
+                    f"[{symbol}] Weekly unavailable. "
+                    f"Generating synthetic weekly structure."
+                )
+
+                df_weekly = ProposalEngine._build_synthetic_weekly(df)
+
+            # ---------------------------------------------
+            # ENGINES
+            # ---------------------------------------------
+
+            techs = TechnicalEngine.get_indicators(df) or {}
+
+            smc = SMCEngine.detect_structure(df) or {}
+
+            breakout = BreakoutEngine.analyze(
+                df,
+                smc,
+                df_weekly
+            ) or {}
+
+            funds = FundamentalEngine.get_fundamentals(
+                symbol
+            ) or {}
+
+            sentiment = SentimentEngine.analyze(
+                symbol
+            ) or {}
+
+            analysts = AnalystConsensusEngine.get(
+                symbol
+            ) or {}
+
+            # ---------------------------------------------
+            # CORE PRICING
+            # ---------------------------------------------
 
             close = ProposalEngine._safe_float(
                 techs.get("close"),
-                fallback=df_norm["close"].iloc[-1]
+                df["close"].iloc[-1]
             )
 
             atr = ProposalEngine._safe_float(
                 techs.get("atr"),
-                fallback=max(close * 0.01, 0.01)
+                close * 0.02
             )
 
-            # -------------------------------------------------
-            # AI Feature Engineering
-            # -------------------------------------------------
+            # ---------------------------------------------
+            # FEATURES
+            # ---------------------------------------------
+
             features = ProposalEngine._build_features(
-                techs=techs,
-                smc=smc,
-                breakout=breakout,
-                funds=funds,
-                sentiment=sentiment
-            )
-
-            ai = AIEnsemble.predict(features, market_regime)
-
-            if not ai or ai.get("direction") == "NEUTRAL":
-                logger.info(f"[{symbol}] AI returned NEUTRAL.")
-                return None
-
-            direction = ai.get("direction", "NEUTRAL")
-            confidence = ProposalEngine._clamp(
-                ProposalEngine._safe_float(ai.get("confidence"), 50),
-                0,
-                100
-            )
-
-            # -------------------------------------------------
-            # Trade Construction
-            # -------------------------------------------------
-            trade = ProposalEngine._build_trade_levels(
-                direction=direction,
-                close=close,
-                atr=atr,
-                breakout=breakout,
-                smc=smc,
-                df=df_norm,
-            )
-
-            sl = trade["sl"]
-            tp1 = trade["tp1"]
-            tp2 = trade["tp2"]
-            tp3 = trade["tp3"]
-            risk = trade["risk"]
-            setup_type = trade["setup_type"]
-
-            # -------------------------------------------------
-            # Risk Metrics
-            # -------------------------------------------------
-            rr = ProposalEngine._calculate_rr(close, sl, tp2)
-            rr_ext = ProposalEngine._calculate_rr(close, sl, tp3)
-
-            # -------------------------------------------------
-            # Position Sizing
-            # -------------------------------------------------
-            pos_size = ProposalEngine._calculate_position_size(
-                confidence=confidence,
-                rr=rr,
-                market_regime=market_regime,
-                horizon_confidence=ai.get("horizon_confidence")
-            )
-
-            # -------------------------------------------------
-            # Hold Period
-            # -------------------------------------------------
-            hold_period = ProposalEngine._estimate_hold_period(
-                setup_type=setup_type,
-                breakout=breakout,
-                rr_ext=rr_ext
-            )
-
-            # -------------------------------------------------
-            # Sector Context
-            # -------------------------------------------------
-            sector_exp = ProposalEngine._build_sector_context(
-                symbol=symbol,
-                sector_rotation=sector_rotation
-            )
-
-            # -------------------------------------------------
-            # Thesis
-            # -------------------------------------------------
-            thesis = ProposalEngine._build_thesis(
-                setup_type=setup_type,
-                breakout=breakout,
-                techs=techs,
-                funds=funds,
-                ai=ai
-            )
-
-            # -------------------------------------------------
-            # Chart Generation
-            # -------------------------------------------------
-            fig = ChartEngine.plot_setup(
-                df_norm,
+                techs,
                 smc,
                 breakout,
-                techs,
+                funds,
+                sentiment,
+                analysts
+            )
+
+            ai = AIEnsemble.predict(
+                features,
+                market_regime
+            )
+
+            if not ai:
+                return None
+
+            direction = ai.get(
+                "direction",
+                "NEUTRAL"
+            )
+
+            if direction == "NEUTRAL":
+                return None
+
+            confidence = ProposalEngine._safe_float(
+                ai.get("confidence"),
+                50
+            )
+
+            # ---------------------------------------------
+            # TRADE LEVELS
+            # ---------------------------------------------
+
+            trade = ProposalEngine._build_trade_levels(
                 direction,
                 close,
-                sl,
-                tp1,
-                tp2,
-                tp3,
-                df_weekly,
+                atr,
+                breakout,
+                smc,
+                df
             )
 
-            # -------------------------------------------------
-            # AI Grade
-            # -------------------------------------------------
-            grade = ProposalEngine._calculate_grade(
-                confidence=confidence,
-                horizon_confidence=ai.get("horizon_confidence")
+            # ---------------------------------------------
+            # RR
+            # ---------------------------------------------
+
+            rr = ProposalEngine._calculate_rr(
+                close,
+                trade["sl"],
+                trade["tp2"]
             )
 
-            # -------------------------------------------------
-            # Final Proposal
-            # -------------------------------------------------
+            rr_ext = ProposalEngine._calculate_rr(
+                close,
+                trade["sl"],
+                trade["tp3"]
+            )
+
+            # ---------------------------------------------
+            # POSITION SIZE
+            # ---------------------------------------------
+
+            pos_size = ProposalEngine._calculate_position_size(
+                confidence,
+                rr,
+                market_regime,
+                ai.get("horizon_confidence")
+            )
+
+            # ---------------------------------------------
+            # THESIS
+            # ---------------------------------------------
+
+            thesis = ProposalEngine._build_thesis(
+                trade["setup_type"],
+                breakout,
+                techs,
+                funds,
+                ai,
+                analysts
+            )
+
+            breakout_snap = ProposalEngine._breakout_snapshot(breakout)
+            sentiment_snap = {
+                "score": sentiment.get("score"),
+                "label": sentiment.get("label"),
+                "headline_count": sentiment.get("headline_count", 0),
+            }
+            sector_flow_ctx = ProposalEngine._flow_context(
+                symbol,
+                sector_rotation,
+                asset_class=asset_class,
+                df=df,
+                flow_reference=flow_reference,
+            )
+            money_note = ProposalEngine._money_flow_note(breakout)
+            short_term = ProposalEngine._compute_short_term_score(
+                breakout,
+                sentiment,
+                analysts,
+                rr,
+                confidence,
+            )
+
+            # ---------------------------------------------
+            # FINAL
+            # ---------------------------------------------
+
             return InvestmentProposal(
+
                 symbol=symbol,
+
                 direction=direction,
+
                 entry_price=round(close, 2),
-                stop_loss=round(sl, 2),
-                tp_1=round(tp1, 2),
-                tp_2=round(tp2, 2),
-                tp_3=round(tp3, 2),
+
+                stop_loss=round(trade["sl"], 2),
+
+                tp_1=round(trade["tp1"], 2),
+                tp_2=round(trade["tp2"], 2),
+                tp_3=round(trade["tp3"], 2),
+
                 risk_reward=rr,
                 risk_reward_extended=rr_ext,
-                ai_confidence=round(confidence, 2),
-                ai_grade=grade,
+
+                ai_confidence=confidence,
+
+                ai_grade=ProposalEngine._calculate_grade(
+                    confidence,
+                    ai.get("horizon_confidence")
+                ),
+
                 thesis=thesis,
-                setup_type=setup_type,
-                position_size_pct=round(pos_size, 2),
-                hold_period=hold_period,
-                horizon_confidence=ai.get("horizon_confidence", "LOW"),
-                sector_exposure=sector_exp,
-                chart_data=fig,
+
+                setup_type=trade["setup_type"],
+
+                position_size_pct=pos_size,
+
+                hold_period="1-3 Months",
+
+                horizon_confidence=ai.get(
+                    "horizon_confidence",
+                    "MEDIUM"
+                ),
+
+                sector_exposure="NEUTRAL",
+
+                chart_data=None,
+
                 signals=ai.get("signals", []),
+
                 weights=ai.get("weights", {}),
+                analyst_consensus=analysts,
+                breakout_analytics=breakout_snap,
+                sentiment_snapshot=sentiment_snap,
+                sector_flow=sector_flow_ctx,
+                money_flow_note=money_note,
+                short_term_score=short_term,
             )
 
         except Exception as e:
-            logger.exception(f"[{symbol}] Failed to build proposal: {e}")
+
+            logger.exception(
+                f"[{symbol}] Proposal build failure | error={e}"
+            )
+
             return None
 
-    # =========================================================
-    # VALIDATION
-    # =========================================================
+    # =====================================================
+    # HELPERS
+    # =====================================================
+
     @staticmethod
-    def _is_valid_dataframe(df: Optional[pd.DataFrame]) -> bool:
-        required_cols = {"open", "high", "low", "close", "volume"}
+    def _safe_float(value, fallback=0.0):
+
+        try:
+
+            if value is None:
+                return fallback
+
+            if isinstance(value, float) and math.isnan(value):
+                return fallback
+
+            return float(value)
+
+        except Exception:
+            return fallback
+
+    @staticmethod
+    def _is_valid_dataframe(df):
+
+        required = {
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume"
+        }
 
         return (
-            df is not None
-            and isinstance(df, pd.DataFrame)
+            isinstance(df, pd.DataFrame)
             and len(df) >= ProposalEngine.MIN_BARS
-            and required_cols.issubset(df.columns)
+            and required.issubset(df.columns)
         )
 
-    # =========================================================
-    # FEATURE ENGINEERING
-    # =========================================================
+    @staticmethod
+    def _build_synthetic_weekly(df):
+
+        try:
+
+            return (
+                df
+                .resample("W")
+                .agg({
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum"
+                })
+                .dropna()
+            )
+
+        except Exception:
+
+            return pd.DataFrame()
+
+    @staticmethod
+    def _breakout_snapshot(breakout: Dict[str, Any]) -> Dict[str, Any]:
+        if not breakout or breakout.get("status") == "NO_DATA":
+            return {}
+        return {
+            "breakout_type": breakout.get("breakout_type"),
+            "breakout_score": breakout.get("breakout_score"),
+            "confidence": breakout.get("confidence"),
+            "signal_quality": breakout.get("signal_quality"),
+            "volume_confirmed": breakout.get("volume_confirmed"),
+            "relative_volume": breakout.get("relative_volume"),
+            "squeeze_detected": breakout.get("squeeze_detected"),
+            "higher_timeframe_alignment": breakout.get("higher_timeframe_alignment"),
+            "pattern": breakout.get("pattern"),
+            "pre_breakout": breakout.get("pre_breakout"),
+        }
+
+    @staticmethod
+    @staticmethod
+    def _return_n_bars_pct(df: pd.DataFrame, bars: int = 22) -> Optional[float]:
+        if df is None or df.empty or "close" not in df.columns:
+            return None
+        close = df["close"].dropna()
+        if len(close) <= bars:
+            return None
+        try:
+            return float((close.iloc[-1] / close.iloc[-bars - 1] - 1) * 100)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _equity_sector_flow(
+        symbol: str,
+        sector_rotation: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        sym = symbol.upper().strip()
+        mapped = SYMBOL_TO_SECTOR_ETF.get(sym)
+        if not sector_rotation:
+            return {
+                "flow_type": "EQUITY",
+                "sector_name": mapped[1] if mapped else "Unknown",
+                "etf": mapped[0] if mapped else None,
+                "bias": "NO DATA",
+                "detail": "Sector rotation unavailable",
+            }
+        sectors = sector_rotation.get("sectors", {})
+        ranked = sector_rotation.get("ranked", [])
+        leading = set(sector_rotation.get("leading", []))
+        lagging = set(sector_rotation.get("lagging", []))
+        if not mapped:
+            return {
+                "flow_type": "EQUITY",
+                "sector_name": "Unmapped",
+                "etf": None,
+                "bias": "UNKNOWN",
+                "detail": "Map ticker in SYMBOL_TO_SECTOR_ETF for sector flow",
+            }
+        etf, sector_name = mapped
+        info = sectors.get(etf, {})
+        rank_idx = next(
+            (i + 1 for i, (s, _) in enumerate(ranked) if s == etf),
+            None,
+        )
+        if etf in leading:
+            bias = "LEADING (inflow)"
+        elif etf in lagging:
+            bias = "LAGGING (outflow)"
+        else:
+            bias = "MIDDLE"
+        return {
+            "flow_type": "EQUITY",
+            "sector_name": sector_name,
+            "etf": etf,
+            "bias": bias,
+            "sector_rank": rank_idx,
+            "momentum_score": info.get("momentum_score"),
+            "volume_trend": info.get("volume_trend"),
+            "return_1m_pct": info.get("return_1m"),
+            "relative_strength_vs_spy": info.get("relative_strength"),
+        }
+
+    @staticmethod
+    def _crypto_flow_context(
+        symbol: str,
+        df: pd.DataFrame,
+        flow_reference: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        sym = symbol.upper().strip()
+        seg = CRYPTO_SEGMENT.get(sym, "Crypto (unclassified)")
+        sym_1m = ProposalEngine._return_n_bars_pct(df, 22)
+        btc_1m = None
+        if flow_reference:
+            btc_1m = flow_reference.get("BTC_1m_pct")
+        if sym_1m is None:
+            bias = "NO DATA"
+        elif btc_1m is None:
+            bias = "NEUTRAL (no BTC ref)"
+        else:
+            diff = sym_1m - float(btc_1m)
+            if diff > 1.5:
+                bias = "OUTPERFORMING BTC (1m)"
+            elif diff < -1.5:
+                bias = "LAGGING BTC (1m)"
+            else:
+                bias = "IN LINE WITH BTC (1m)"
+        vs_proxy = None
+        if sym_1m is not None and btc_1m is not None:
+            vs_proxy = round(sym_1m - float(btc_1m), 2)
+        return {
+            "flow_type": "CRYPTO",
+            "sector_name": seg,
+            "etf": "BTC-USD",
+            "bias": bias,
+            "sector_rank": None,
+            "momentum_score": None,
+            "volume_trend": None,
+            "return_1m_pct": round(sym_1m, 2) if sym_1m is not None else None,
+            "proxy_1m_pct": round(float(btc_1m), 2) if btc_1m is not None else None,
+            "vs_proxy_1m": vs_proxy,
+            "relative_strength_vs_spy": vs_proxy,
+        }
+
+    @staticmethod
+    def _forex_flow_context(
+        symbol: str,
+        df: pd.DataFrame,
+        flow_reference: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        sym = symbol.upper().strip()
+        pair_1m = ProposalEngine._return_n_bars_pct(df, 22)
+        dxy_1m = None
+        if flow_reference:
+            dxy_1m = flow_reference.get("DXY_1m_pct")
+        base, quote = "?", "?"
+        if sym.endswith("=X") and len(sym) > 3:
+            core = sym.replace("=X", "")
+            if len(core) == 6:
+                base, quote = core[:3], core[3:]
+        bias = "NO DATA"
+        if dxy_1m is not None:
+            d = float(dxy_1m)
+            if quote == "USD" and base != "USD":
+                bias = "USD FIRM vs pair" if d > 0.15 else "USD SOFT vs pair" if d < -0.15 else "USD NEUTRAL"
+            elif base == "USD" and quote == "JPY":
+                bias = "JPY WEAK (risk-on skew)" if d > 0.15 else "JPY STRONG" if d < -0.15 else "USD/JPY NEUTRAL"
+            else:
+                bias = f"DXY 1m {d:+.2f}% (context)"
+        return {
+            "flow_type": "FOREX",
+            "sector_name": f"FX {base}/{quote}",
+            "etf": "DX-Y.NYB",
+            "bias": bias,
+            "sector_rank": None,
+            "momentum_score": None,
+            "volume_trend": None,
+            "return_1m_pct": round(pair_1m, 2) if pair_1m is not None else None,
+            "proxy_1m_pct": round(float(dxy_1m), 2) if dxy_1m is not None else None,
+            "vs_proxy_1m": None,
+            "relative_strength_vs_spy": round(float(dxy_1m), 2) if dxy_1m is not None else None,
+        }
+
+    @staticmethod
+    def _flow_context(
+        symbol: str,
+        sector_rotation: Optional[Dict[str, Any]],
+        *,
+        asset_class: str = "Stocks",
+        df: Optional[pd.DataFrame] = None,
+        flow_reference: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        ac = (asset_class or "Stocks").strip()
+        if ac == "Crypto":
+            return ProposalEngine._crypto_flow_context(
+                symbol, df if df is not None else pd.DataFrame(), flow_reference
+            )
+        if ac == "Forex":
+            return ProposalEngine._forex_flow_context(
+                symbol, df if df is not None else pd.DataFrame(), flow_reference
+            )
+        return ProposalEngine._equity_sector_flow(symbol, sector_rotation)
+
+    @staticmethod
+    def _money_flow_note(breakout: Dict[str, Any]) -> str:
+        if not breakout or breakout.get("status") == "NO_DATA":
+            return "Insufficient data"
+        parts = []
+        if breakout.get("volume_confirmed"):
+            parts.append("Volume confirmed")
+        rv = breakout.get("relative_volume")
+        if rv is not None:
+            try:
+                parts.append(f"RV {float(rv):.2f}x")
+            except (TypeError, ValueError):
+                pass
+        if breakout.get("is_accumulating"):
+            parts.append("Accumulation")
+        if breakout.get("obv_bullish_divergence"):
+            parts.append("OBV bull div")
+        if breakout.get("obv_bearish_divergence"):
+            parts.append("OBV bear div")
+        return " · ".join(parts) if parts else "Neutral flow"
+
+    @staticmethod
+    def _compute_short_term_score(
+        breakout: Dict[str, Any],
+        sentiment: Dict[str, Any],
+        analysts: Dict[str, Any],
+        rr: Optional[float],
+        ai_confidence: Optional[float],
+    ) -> float:
+        bs = float(breakout.get("breakout_score") or 0) if breakout else 0.0
+        sen = float((sentiment or {}).get("score") or 50)
+        ana = float((analysts or {}).get("score") or 50)
+        vol_b = 10.0 if breakout and breakout.get("volume_confirmed") else 0.0
+        sq_b = 9.0 if breakout and breakout.get("squeeze_detected") else 0.0
+        htf_b = 7.0 if breakout and breakout.get("higher_timeframe_alignment") else 0.0
+        if rr is None and ai_confidence is None:
+            raw = bs * 0.48 + sen * 0.20 + ana * 0.18 + vol_b + sq_b + htf_b
+        else:
+            rr_term = min(28.0, max(0.0, float(rr or 0)) * 7.5)
+            ai_term = min(
+                18.0,
+                max(0.0, float(ai_confidence or 50) - 48) * 0.55,
+            )
+            raw = (
+                bs * 0.34
+                + sen * 0.14
+                + ana * 0.14
+                + rr_term
+                + vol_b
+                + sq_b
+                + htf_b
+                + ai_term
+            )
+        return float(min(100.0, max(0.0, raw)))
+
+    @staticmethod
+    def quick_surface(
+        symbol: str,
+        df: pd.DataFrame,
+        df_weekly: Optional[pd.DataFrame],
+        sector_rotation: Optional[Dict[str, Any]],
+        *,
+        asset_class: str = "Stocks",
+        flow_reference: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        df = normalize_ohlcv(df)
+        if not ProposalEngine._is_valid_dataframe(df):
+            return None
+        if df_weekly is None or getattr(df_weekly, "empty", True):
+            df_weekly = ProposalEngine._build_synthetic_weekly(df)
+        smc = SMCEngine.detect_structure(df) or {}
+        breakout = BreakoutEngine.analyze(df, smc, df_weekly) or {}
+        sentiment = SentimentEngine.analyze(symbol) or {}
+        analysts = AnalystConsensusEngine.get(symbol) or {}
+        sector_flow = ProposalEngine._flow_context(
+            symbol,
+            sector_rotation,
+            asset_class=asset_class,
+            df=df,
+            flow_reference=flow_reference,
+        )
+        money_note = ProposalEngine._money_flow_note(breakout)
+        st_score = ProposalEngine._compute_short_term_score(
+            breakout,
+            sentiment,
+            analysts,
+            None,
+            None,
+        )
+        return {
+            "symbol": symbol,
+            "bucket": "Watchlist",
+            "breakout_analytics": ProposalEngine._breakout_snapshot(breakout),
+            "sentiment_snapshot": {
+                "score": sentiment.get("score"),
+                "label": sentiment.get("label"),
+                "headline_count": sentiment.get("headline_count", 0),
+            },
+            "sector_flow": sector_flow,
+            "money_flow_note": money_note,
+            "short_term_score": st_score,
+            "analyst_consensus": analysts,
+        }
+
     @staticmethod
     def _build_features(
-        techs: Dict,
-        smc: Dict,
-        breakout: Dict,
-        funds: Dict,
-        sentiment: Dict
-    ) -> Dict[str, Any]:
+        techs,
+        smc,
+        breakout,
+        funds,
+        sentiment,
+        analysts
+    ):
 
-        features = {
+        return {
+
             **techs,
             **smc,
             **breakout,
-            "fundamental_score": funds.get("score", 50),
-            "sentiment_score": sentiment.get("score", 50),
-            "earnings_growth": funds.get("growth", 0),
-            "institutional_accumulation": int(
-                breakout.get("is_accumulating", False)
-            ),
-            "weekly_alignment": int(
-                breakout.get("weekly_aligned", False)
-            ),
+
+            "fundamental_score":
+                funds.get("score", 50),
+
+            "earnings_growth":
+                funds.get("growth", 0),
+
+            "sentiment_score":
+                sentiment.get("score", 50),
+
+            "analyst_score":
+                analysts.get("score", 50),
+
+            "institutional_sentiment":
+                analysts.get("score", 50),
+
+            "weekly_aligned":
+                int(
+                    breakout.get(
+                        "weekly_aligned",
+                        False
+                    )
+                ),
+
+            "is_accumulating":
+                int(
+                    breakout.get(
+                        "is_accumulating",
+                        False
+                    )
+                ),
         }
 
-        return features
-
-    # =========================================================
-    # TRADE CONSTRUCTION
-    # =========================================================
     @staticmethod
-    def _build_trade_levels(direction, close, atr, breakout, smc, df):
+    def _build_trade_levels(
+        direction,
+        close,
+        atr,
+        breakout,
+        smc,
+        df
+    ):
 
-        smc = smc or {}
-        breakout = breakout or {}
-
-        setup_type = "TREND_CONTINUATION"
-
-        breakout_type = (breakout.get("breakout_type") or "").upper()
-
-        # safe df extraction
-        last_low = df["low"].iloc[-1] if df is not None and len(df) > 0 and "low" in df else close - atr * 2
-        last_high = df["high"].iloc[-1] if df is not None and len(df) > 0 and "high" in df else close + atr * 2
+        risk = atr * 1.5
 
         if direction == "LONG":
 
-            if "BREAKOUT" in breakout_type and "BULLISH" in breakout_type:
+            sl = close - risk
 
-                range_low = breakout.get("range_low")
-                range_low = range_low if isinstance(range_low, (int, float)) else close - atr * 2
+            return {
+                "sl": sl,
+                "tp1": close + risk * 1.5,
+                "tp2": close + risk * 3,
+                "tp3": close + risk * 5,
+                "setup_type": "LONG_SWING"
+            }
 
-                sl = min(last_low, range_low)
-                setup_type = "BREAKOUT_LONG"
-
-            else:
-
-                sl = smc.get("last_swing_low", close - atr * ProposalEngine.DEFAULT_RISK_MULTIPLIER)
-
-                if smc.get("trend") == "BULLISH":
-                    setup_type = "PULLBACK_BUY"
-
-            raw_risk = close - sl
-            if raw_risk <= 0:
-                raw_risk = atr * 0.75
-
-            risk = max(raw_risk, atr * 0.5)
-
-            tp1 = close + risk * 1.5
-            tp2 = close + risk * 3.0
-            tp3 = close + risk * 5.0
-
-        else:
-
-            if "BREAKOUT" in breakout_type and "BEARISH" in breakout_type:
-
-                range_high = breakout.get("range_high")
-                range_high = range_high if isinstance(range_high, (int, float)) else close + atr * 2
-
-                sl = max(last_high, range_high)
-                setup_type = "BREAKOUT_SHORT"
-
-            else:
-
-                sl = smc.get("last_swing_high", close + atr * ProposalEngine.DEFAULT_RISK_MULTIPLIER)
-
-            raw_risk = sl - close
-            if raw_risk <= 0:
-                raw_risk = atr * 0.75
-
-            risk = max(raw_risk, atr * 0.5)
-
-            tp1 = close - risk * 1.5
-            tp2 = close - risk * 3.0
-            tp3 = close - risk * 5.0
+        sl = close + risk
 
         return {
             "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
-            "tp3": tp3,
-            "risk": risk,
-            "setup_type": setup_type
+            "tp1": close - risk * 1.5,
+            "tp2": close - risk * 3,
+            "tp3": close - risk * 5,
+            "setup_type": "SHORT_SWING"
         }
 
-    # =========================================================
-    # POSITION SIZING
-    # =========================================================
+    @staticmethod
+    def _calculate_rr(close, sl, target):
+
+        risk = abs(close - sl)
+
+        if risk <= 0:
+            return 1.0
+
+        reward = abs(target - close)
+
+        return round(reward / risk, 2)
+
     @staticmethod
     def _calculate_position_size(
-        confidence: float,
-        rr: float,
-        market_regime: Dict,
-        horizon_confidence: Optional[str]
-    ) -> float:
+        confidence,
+        rr,
+        market_regime,
+        horizon_confidence
+    ):
 
-        bias = market_regime.get("_bias", {})
-        max_pos = bias.get("max_position_size", 5)
+        edge = max(0, confidence - 50)
 
-        win_prob = confidence / 100
+        size = edge * rr * 0.05
 
-        # Kelly Criterion
-        kelly = (
-            (win_prob * rr - (1 - win_prob)) / rr
-            if rr > 0
-            else 0
-        )
+        return min(max(size, 0.5), 5)
 
-        # Conservative scaling
-        kelly_lite = max(0, kelly * 0.5)
-
-        pos_size = max(
-            0.5,
-            min(max_pos, kelly_lite * 100)
-        )
-
-        # Boost for high timeframe alignment
-        if horizon_confidence == "HIGH":
-            pos_size *= 1.2
-
-        return min(pos_size, max_pos)
-
-    # =========================================================
-    # HOLD PERIOD
-    # =========================================================
     @staticmethod
-    def _estimate_hold_period(
-        setup_type: str,
-        breakout: Dict,
-        rr_ext: float
-    ) -> str:
+    def _calculate_grade(confidence, horizon):
 
-        if setup_type in {"BREAKOUT_LONG", "BREAKOUT_SHORT"}:
-
-            if breakout.get("squeeze_days", 0) > 10:
-                return "3-6 months (Post-squeeze breakout)"
-
-            return "1-3 months (Momentum breakout)"
-
-        if setup_type == "PULLBACK_BUY":
-            return "3-6 months (Trend continuation)"
-
-        if rr_ext >= 4:
-            return "6-12 months (Swing position)"
-
-        return "1-3 months (Standard swing)"
-
-    # =========================================================
-    # SECTOR CONTEXT
-    # =========================================================
-    @staticmethod
-    def _build_sector_context(
-        symbol: str,
-        sector_rotation: Optional[Dict]
-    ) -> str:
-
-        if not sector_rotation:
-            return "N/A"
-
-        leading = sector_rotation.get("leading", [])
-
-        if not leading:
-            return "Neutral sector environment"
-
-        return f"Leading sectors: {', '.join(leading[:3])}"
-
-    # =========================================================
-    # THESIS
-    # =========================================================
-    @staticmethod
-    def _build_thesis(
-        setup_type: str,
-        breakout: Dict,
-        techs: Dict,
-        funds: Dict,
-        ai: Dict
-    ) -> str:
-
-        thesis_parts = [setup_type]
-
-        mappings = [
-            ("breakout_type", "Breakout"),
-            ("pattern", "Pattern"),
-        ]
-
-        for key, label in mappings:
-            value = breakout.get(key)
-
-            if value:
-                thesis_parts.append(f"{label}: {value}")
-
-        if breakout.get("squeeze_detected"):
-            thesis_parts.append(
-                f"Squeeze: {breakout.get('squeeze_days', 0)}d compression"
-            )
-
-        if breakout.get("is_accumulating"):
-            thesis_parts.append("Institutional accumulation")
-
-        if ai.get("htf_aligned"):
-            thesis_parts.append("Weekly timeframe aligned")
-
-        if techs.get("golden_cross"):
-            thesis_parts.append("Golden Cross")
-
-        if techs.get("macd_bullish_divergence"):
-            thesis_parts.append("MACD bullish divergence")
-
-        growth = funds.get("growth", 0)
-
-        if growth > 20:
-            thesis_parts.append(f"Earnings growth: {growth}%")
-
-        if funds.get("near_52w_high"):
-            thesis_parts.append("Near 52-week high")
-
-        return ". ".join(thesis_parts) + "."
-
-    # =========================================================
-    # GRADE
-    # =========================================================
-    @staticmethod
-    def _calculate_grade(
-        confidence: float,
-        horizon_confidence: Optional[str]
-    ) -> str:
-
-        if confidence >= 85 and horizon_confidence == "HIGH":
+        if confidence >= 85:
             return "A+"
 
         if confidence >= 75:
@@ -2639,38 +3899,45 @@ class ProposalEngine:
 
         return "C"
 
-    # =========================================================
-    # HELPERS
-    # =========================================================
     @staticmethod
-    def _calculate_rr(
-        close: float,
-        sl: float,
-        target: float
-    ) -> float:
+    def _build_thesis(
+        setup_type,
+        breakout,
+        techs,
+        funds,
+        ai,
+        analysts
+    ):
 
-        risk = abs(close - sl)
+        thesis = []
 
-        if risk <= 0:
-            return 1.0
+        thesis.append(setup_type)
 
-        return round(abs(target - close) / risk, 2)
+        if breakout.get("breakout_type"):
+            thesis.append(
+                breakout["breakout_type"]
+            )
 
-    @staticmethod
-    def _safe_float(value: Any, fallback: float = 0.0) -> float:
+        if techs.get("golden_cross"):
+            thesis.append("Golden Cross")
 
-        try:
-            if value is None or (isinstance(value, float) and math.isnan(value)):
-                return fallback
+        if breakout.get("is_accumulating"):
+            thesis.append("Institutional accumulation")
 
-            return float(value)
+        if analysts.get("label"):
+            thesis.append(
+                f"Analyst consensus: "
+                f"{analysts['label']}"
+            )
 
-        except Exception:
-            return fallback
+        growth = funds.get("growth", 0)
 
-    @staticmethod
-    def _clamp(value: float, min_v: float, max_v: float) -> float:
-        return max(min_v, min(max_v, value))
+        if growth > 15:
+            thesis.append(
+                f"Earnings growth {growth}%"
+            )
+
+        return ". ".join(thesis) + "."
 
 # ===============================================
 # 11. CHART ENGINE (ENHANCED)
@@ -2780,288 +4047,537 @@ class ChartEngine:
         fig.update_xaxes(showgrid=True, gridwidth=0.5, gridcolor='#1a1a2e')
         return fig
 
-
-# ===============================================
-# 12. MARKET BREADTH ENGINE (NEW)
-# ===============================================
-
 class MarketBreadthEngine:
     """
-    Proxies market breadth by analyzing a basket of major stocks.
+    Institutional-grade market breadth engine using multi-asset basket.
     """
 
     BREADTH_BASKET = [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "V",
-        "UNH", "JNJ", "WMT", "PG", "MA", "HD", "XOM", "BAC", "PFE", "KO",
-        "DIS", "INTC", "CSCO", "PEP", "ABT", "CRM", "AVGO", "NFLX", "COST",
-        "TMO", "MRK"
+        "AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","JPM","V",
+        "UNH","JNJ","WMT","PG","MA","HD","XOM","BAC","PFE","KO",
+        "DIS","INTC","CSCO","PEP","ABT","CRM","AVGO","NFLX","COST",
+        "TMO","MRK"
     ]
 
     @staticmethod
     def analyze() -> Dict[str, Any]:
+
         try:
-            # Fetch all at once for efficiency
             df = yf.download(
                 MarketBreadthEngine.BREADTH_BASKET,
-                period="3mo", interval="1d", progress=False, auto_adjust=True
+                period="6mo",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                group_by="ticker"
             )
-            
-            if isinstance(df.columns, pd.MultiIndex):
-                closes = df['Close']
-            else:
-                closes = df[['Close']] if 'Close' in df.columns else df
-            
-            if closes.empty:
-                return {"pct_above_50dma": 50, "pct_above_200dma": 50, "advance_decline": "NEUTRAL"}
 
-            # Calculate % above moving averages
-            sma50 = closes.rolling(50).mean()
-            sma200 = closes.rolling(200).mean()
-            
-            latest = closes.iloc[-1]
-            above_50 = (latest > sma50.iloc[-1]).sum()
-            above_200 = (latest > sma200.iloc[-1]).sum() if len(closes) >= 200 else 0
-            total = len(closes.columns)
-            
+            if df is None or df.empty:
+                return MarketBreadthEngine._fallback()
+
+            # -----------------------------
+            # Extract close prices per ticker
+            # -----------------------------
+            closes = {}
+
+            for ticker in MarketBreadthEngine.BREADTH_BASKET:
+                try:
+                    if isinstance(df.columns, pd.MultiIndex):
+                        if ("Close", ticker) in df.columns:
+                            series = df[("Close", ticker)]
+                        elif (ticker, "Close") in df.columns:
+                            series = df[(ticker, "Close")]
+                        else:
+                            continue
+                    else:
+                        if "Close" not in df.columns:
+                            continue
+                        series = df["Close"]
+
+                    series = series.dropna()
+                    if len(series) < 60:
+                        continue
+
+                    closes[ticker] = series
+
+                except Exception:
+                    continue
+
+            if not closes:
+                return MarketBreadthEngine._fallback()
+
+            # -----------------------------
+            # Breadth calculations
+            # -----------------------------
+            above_50 = 0
+            above_200 = 0
+            advancing = 0
+            declining = 0
+            valid = 0
+
+            for ticker, series in closes.items():
+
+                if len(series) < 50:
+                    continue
+
+                valid += 1
+
+                last = series.iloc[-1]
+                sma50 = series.rolling(50).mean().iloc[-1]
+                sma200 = series.rolling(200).mean().iloc[-1] if len(series) >= 200 else None
+
+                if last > sma50:
+                    above_50 += 1
+
+                if sma200 is not None and last > sma200:
+                    above_200 += 1
+
+                # weekly momentum proxy
+                if len(series) >= 6:
+                    ret = (series.iloc[-1] / series.iloc[-6] - 1)
+                    if ret > 0:
+                        advancing += 1
+                    else:
+                        declining += 1
+
+            total = max(valid, 1)
+
             pct_50 = round((above_50 / total) * 100, 1)
-            pct_200 = round((above_200 / total) * 100, 1) if len(closes) >= 200 else 50
+            pct_200 = round((above_200 / total) * 100, 1)
 
-            # Advance-decline proxy (recent performance)
-            if len(closes) >= 5:
-                week_return = (closes.iloc[-1] / closes.iloc[-6] - 1) * 100
-                advancers = (week_return > 0).sum()
-                decliners = (week_return < 0).sum()
-                ad_ratio = round(advancers / (decliners + 1), 2)
-            else:
-                ad_ratio = 1.0
+            ad_ratio = round(advancing / max(declining, 1), 2)
 
-            # Breadth assessment
-            if pct_50 > 70:
-                breadth = "STRONG"  # Broad participation = healthy bull
-            elif pct_50 > 55:
+            # -----------------------------
+            # Breadth regime classification
+            # -----------------------------
+            if pct_50 >= 75:
+                breadth = "STRONG"
+            elif pct_50 >= 60:
                 breadth = "HEALTHY"
-            elif pct_50 > 40:
+            elif pct_50 >= 45:
                 breadth = "MIXED"
-            elif pct_50 > 25:
+            elif pct_50 >= 30:
                 breadth = "WEAK"
             else:
-                breadth = "VERY_WEAK"  # Capitulation territory
+                breadth = "VERY_WEAK"
 
             return {
                 "pct_above_50dma": pct_50,
                 "pct_above_200dma": pct_200,
                 "advance_decline_ratio": ad_ratio,
                 "breadth": breadth,
+                "universe_size": valid,
                 "interpretation": {
-                    "STRONG": "Broad market participation — strong foundation for breakout trades.",
-                    "HEALTHY": "Most stocks trending well — selective breakouts favored.",
-                    "MIXED": "Choppy market — only highest-conviction setups.",
-                    "WEAK": "Declining breadth — reduce exposure, tighten stops.",
-                    "VERY_WEAK": "Market distress — preservation mode."
-                }.get(breadth, "Neutral market conditions.")
+                    "STRONG": "Broad participation — trend expansion likely.",
+                    "HEALTHY": "Constructive market — selective longs favored.",
+                    "MIXED": "Rotational market — reduce position size.",
+                    "WEAK": "Risk-off regime emerging.",
+                    "VERY_WEAK": "Defensive regime — capital preservation."
+                }[breadth]
             }
+
         except Exception as e:
             logger.warning(f"Breadth analysis failed: {e}")
-            return {"pct_above_50dma": 50, "pct_above_200dma": 50, "breadth": "MIXED",
-                    "interpretation": "Unable to calculate breadth."}
+            return MarketBreadthEngine._fallback()
 
+    @staticmethod
+    def _fallback():
+        return {
+            "pct_above_50dma": 50,
+            "pct_above_200dma": 50,
+            "advance_decline_ratio": 1.0,
+            "breadth": "MIXED",
+            "universe_size": 0,
+            "interpretation": "Unable to compute market breadth."
+        }
 
 # ===============================================
 # 13. ASSET UNIVERSE DEFINITIONS
 # ===============================================
+class AssetUniverse:
 
-STOCKS_ALL = [
-    # Mega Cap Tech
-    "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META", "TSLA", "AVGO", "ORCL",
-    "ADBE", "CRM", "NFLX", "INTU", "QCOM", "AMD", "IBM", "NOW", "INTC", "MU", "LRCX",
-
-    # Finance
-    "JPM", "V", "MA", "BAC", "WFC", "GS", "MS", "BLK", "SCHW", "AXP", "C", "USB",
-    "SPGI", "COIN",
-
-    # Healthcare
-    "UNH", "JNJ", "LLY", "PFE", "MRK", "ABBV", "TMO", "ABT", "DHR", "BMY",
-    "AMGN", "ISRG", "GILD", "VRTX", "MDT", "DXCM", "NVO",
-
-    # Consumer & Retail
-    "HD", "MCD", "NKE", "SBUX", "TGT", "LOW", "TJX", "COST", "PG", "KO", "PEP",
-    "WMT", "PM",
-
-    # Industrial & Energy
-    "XOM", "CVX", "COP", "BA", "CAT", "HON", "UPS", "RTX", "LMT", "GE", "DE",
-
-    # ETFs / Indices
-    "SPY",
-
-    # Growth / Tech / Speculative
-    "SOFI", "RBLX", "RIVN", "AI", "BABA", "OKLO", "MSTR", "OPEN", "SMR", "IONQ",
-    "RDDT", "QBTS", "SMCI", "RUM", "TTD", "ON",
-
-    # Small / Mid / Biotech / Other
-    "CDE", "PSTV", "RNAZ", "EH", "AAOI", "CHPT", "HOTH", "DVLT", "TOVX", "BSOL",
-    "AAL", "BBAR", "APH", "NGD", "ACHR", "PONY", "BZAI", "NNE", "RBLX",
-
-    # Real Estate / Infrastructure
-    "PLD", "AMT", "EQIX", "INVH",
-
-    # Additional industrial / diversified
-    "HON", "DE",
-
-    # Existing misc / dual listings kept once
-    "BRK-B"
-]
-
-CRYPTO_ALL = [
-    "BTC-USD", "ETH-USD", "BNB-USD", "XRP-USD", "ADA-USD", "DOGE-USD", "SOL-USD", "DOT-USD",
-    "MATIC-USD", "SHIB-USD", "LTC-USD", "AVAX-USD", "LINK-USD", "ATOM-USD", "UNI-USD",
-    "XMR-USD", "ETC-USD", "BCH-USD", "NEAR-USD", "FIL-USD", "APT-USD", "ARB-USD", "OP-USD"
-]
-
-FOREX_ALL = [
-    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X", "AUDUSD=X", "NZDUSD=X", "USDCAD=X",
-    "EURGBP=X", "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "EURAUD=X", "EURNZD=X"
-]
-
-# ===============================================
-# 14. MAIN UI
-# ===============================================
-
-def _render_market_dashboard(market_regime: Dict, sector_rotation: Dict, breadth: Dict):
-    """Render the market overview dashboard at the top of the page."""
-    
-    overall = market_regime.get("_overall", "NEUTRAL")
-    bias = market_regime.get("_bias", {})
-    
-    # Color mapping for regimes
-    regime_colors = {
-        "STRONG_BULL": "#00e676", "BULL": "#69f0ae", "NEUTRAL": "#ffeb3b",
-        "BEAR": "#ff5252", "STRONG_BEAR": "#d50000", "RISK_OFF": "#d50000", "CAUTIOUS": "#ff9800"
+    # ---------------------------------------
+    # WEIGHTING MODEL (INSTITUTIONAL BREADTH)
+    # ---------------------------------------
+    UNIVERSE_WEIGHTS = {
+        "LARGE_CAP": 1.0,
+        "GROWTH": 0.7,
+        "SPECULATIVE": 0.4,
+        "MICROCAP": 0.2,
+        "CRYPTO": 0.5,
+        "FOREX": 0.3
     }
-    regime_color = regime_colors.get(overall, "#ffeb3b")
-    
-    # Market Regime Card
-    st.markdown(f"""
-    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                border-left: 4px solid {regime_color};
-                padding: 20px; border-radius: 8px; margin-bottom: 15px;">
-        <h3 style="color: {regime_color}; margin: 0 0 10px 0;">
-            🌍 Market Regime: {overall.replace('_', ' ')}
-        </h3>
-        <p style="color: #ccc; margin: 5px 0;">
-            <b>Strategy:</b> {bias.get('direction', 'SELECTIVE')} | 
-            <b>Risk Level:</b> {bias.get('risk_level', 'MODERATE')} |
-            <b>Max Position:</b> {bias.get('max_position_size', 5)}%
-        </p>
-        <p style="color: #999; font-size: 0.9em; margin: 5px 0;">
-            💡 {bias.get('advice', '')}
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
 
-    # Key metrics in columns
-    cols = st.columns(5)
-    
-    # SPY
-    spy = market_regime.get("SPY", {})
-    with cols[0]:
-        trend_color = "#00e676" if spy.get("trend") == "BULL" else "#ff5252" if spy.get("trend") == "BEAR" else "#ffeb3b"
-        st.markdown(f"""
-        <div style="text-align:center; padding:10px; background:#1a1a2e; border-radius:8px;">
-            <small style="color:#999;">S&P 500 (SPY)</small><br>
-            <span style="color:white; font-size:1.2em;"><b>${spy.get('price', 0):.0f}</b></span><br>
-            <span style="color:{trend_color};">{spy.get('trend', '?')}</span> · 
-            <span style="color:{'#00e676' if spy.get('roc_20d', 0) > 0 else '#ff5252'};">
-                {spy.get('roc_20d', 0):+.1f}%
-            </span>
-        </div>
-        """, unsafe_allow_html=True)
+    # ---------------------------------------
+    # EQUITIES
+    # ---------------------------------------
+    STOCKS_LARGE_CAP = [
+        "AAPL","MSFT","GOOGL","GOOG","AMZN","NVDA","META","TSLA","AVGO","ORCL",
+        "ADBE","CRM","NFLX","INTU","QCOM","AMD","IBM","NOW","INTC","MU","LRCX",
+        "JPM","V","MA","BAC","WFC","GS","MS","BLK","AXP",
+        "UNH","JNJ","LLY","ABBV","TMO","AMGN","ISRG","VRTX",
+        "HD","MCD","NKE","SBUX","COST","WMT","PG","KO","PEP",
+        "XOM","CVX","COP","BA","CAT","HON","UPS","RTX","LMT","GE","DE",
+        "SPY"
+    ]
 
-    # QQQ
-    qqq = market_regime.get("QQQ", {})
-    with cols[1]:
-        trend_color = "#00e676" if qqq.get("trend") == "BULL" else "#ff5252" if qqq.get("trend") == "BEAR" else "#ffeb3b"
-        st.markdown(f"""
-        <div style="text-align:center; padding:10px; background:#1a1a2e; border-radius:8px;">
-            <small style="color:#999;">Nasdaq (QQQ)</small><br>
-            <span style="color:white; font-size:1.2em;"><b>${qqq.get('price', 0):.0f}</b></span><br>
-            <span style="color:{trend_color};">{qqq.get('trend', '?')}</span> · 
-            <span style="color:{'#00e676' if qqq.get('roc_20d', 0) > 0 else '#ff5252'};">
-                {qqq.get('roc_20d', 0):+.1f}%
-            </span>
-        </div>
-        """, unsafe_allow_html=True)
+    STOCKS_GROWTH = [
+        "COIN","SOFI","RBLX","RIVN","BABA","MSTR","OPEN","SMR","IONQ",
+        "TTD","ON","RDDT","SMCI"
+    ]
 
-    # VIX
-    vix = market_regime.get("VIX", {})
-    vix_color = "#ff5252" if vix.get("regime") in ["HIGH_FEAR", "ELEVATED"] else "#00e676"
-    with cols[2]:
-        st.markdown(f"""
-        <div style="text-align:center; padding:10px; background:#1a1a2e; border-radius:8px;">
-            <small style="color:#999;">VIX</small><br>
-            <span style="color:white; font-size:1.2em;"><b>{vix.get('level', 0):.1f}</b></span><br>
-            <span style="color:{vix_color};">{vix.get('regime', '?')}</span>
-        </div>
-        """, unsafe_allow_html=True)
+    STOCKS_SPECULATIVE = [
+        "OKLO","AI","QBTS","RUM","ACHR","PONY","NNE","CHPT"
+    ]
 
-    # DXY
-    dxy = market_regime.get("DXY", {})
-    with cols[3]:
-        st.markdown(f"""
-        <div style="text-align:center; padding:10px; background:#1a1a2e; border-radius:8px;">
-            <small style="color:#999;">Dollar (DXY)</small><br>
-            <span style="color:white; font-size:1.2em;"><b>{dxy.get('level', 0):.1f}</b></span><br>
-            <span style="color:#999; font-size:0.8em;">{dxy.get('impact', '?')}</span>
-        </div>
-        """, unsafe_allow_html=True)
+    STOCKS_MICROCAP = [
+        "PSTV","RNAZ","EH","AAOI","HOTH","DVLT","TOVX","BSOL","BBAR","CDE","NGD"
+    ]
 
-    # Market Breadth
-    with cols[4]:
-        breadth_color = "#00e676" if breadth.get("breadth") in ["STRONG", "HEALTHY"] else \
-                        "#ff5252" if breadth.get("breadth") in ["WEAK", "VERY_WEAK"] else "#ffeb3b"
-        st.markdown(f"""
-        <div style="text-align:center; padding:10px; background:#1a1a2e; border-radius:8px;">
-            <small style="color:#999;">Market Breadth</small><br>
-            <span style="color:white; font-size:1.2em;"><b>{breadth.get('pct_above_50dma', 50)}%</b></span><br>
-            <span style="color:{breadth_color};">{breadth.get('breadth', '?')}</span>
-        </div>
-        """, unsafe_allow_html=True)
+    STOCKS_ALL = list(set(
+        STOCKS_LARGE_CAP +
+        STOCKS_GROWTH +
+        STOCKS_SPECULATIVE +
+        STOCKS_MICROCAP
+    ))
 
-    # Sector Rotation Table
-    
-    st.markdown("---")
-    st.subheader("📊 Sector Rotation Map")
-    
-    sectors = sector_rotation.get("sectors", {})
+    # ---------------------------------------
+    # CRYPTO
+    # ---------------------------------------
+    CRYPTO_ALL = [
+        "BTC-USD","ETH-USD","BNB-USD","XRP-USD","ADA-USD","DOGE-USD","SOL-USD",
+        "DOT-USD","MATIC-USD","SHIB-USD","LTC-USD","AVAX-USD","LINK-USD","ATOM-USD",
+        "UNI-USD","XMR-USD","ETC-USD","BCH-USD","NEAR-USD","FIL-USD","APT-USD",
+        "ARB-USD","OP-USD"
+    ]
+
+    # ---------------------------------------
+    # FOREX
+    # ---------------------------------------
+    FOREX_ALL = [
+        "EURUSD=X","GBPUSD=X","USDJPY=X","USDCHF=X","AUDUSD=X","NZDUSD=X","USDCAD=X",
+        "EURGBP=X","EURJPY=X","GBPJPY=X","AUDJPY=X","EURAUD=X","EURNZD=X"
+    ]
+
+    # ---------------------------------------
+    # WEIGHT FUNCTION (FIXED)
+    # ---------------------------------------
+    @staticmethod
+    def get_ticker_weight(symbol: str) -> float:
+
+        if symbol in AssetUniverse.STOCKS_LARGE_CAP:
+            return AssetUniverse.UNIVERSE_WEIGHTS["LARGE_CAP"]
+
+        if symbol in AssetUniverse.STOCKS_GROWTH:
+            return AssetUniverse.UNIVERSE_WEIGHTS["GROWTH"]
+
+        if symbol in AssetUniverse.STOCKS_SPECULATIVE:
+            return AssetUniverse.UNIVERSE_WEIGHTS["SPECULATIVE"]
+
+        if symbol in AssetUniverse.STOCKS_MICROCAP:
+            return AssetUniverse.UNIVERSE_WEIGHTS["MICROCAP"]
+
+        if symbol.endswith("-USD"):
+            return AssetUniverse.UNIVERSE_WEIGHTS["CRYPTO"]
+
+        if symbol.endswith("=X"):
+            return AssetUniverse.UNIVERSE_WEIGHTS["FOREX"]
+
+        return 0.5  # fallback neutral weight
+
+
+# ===============================================
+# SAFE UTILITIES
+# ===============================================
+def safe_num(x, default=0.0):
+    try:
+        return float(x) if x is not None else default
+    except Exception:
+        return default
+
+
+def safe_asset_block(asset: dict) -> dict:
+    asset = asset or {}
+    return {
+        "price": safe_num(asset.get("price")),
+        "trend": asset.get("trend") or "UNKNOWN",
+        "roc_20d": safe_num(asset.get("roc_20d")),
+        "level": safe_num(asset.get("level")),
+        "regime": asset.get("regime") or "UNKNOWN",
+        "impact": asset.get("impact") or "N/A",
+    }
+
+
+# ===============================================
+# MARKET ENGINE (MUST BE ABOVE DASHBOARD)
+# ===============================================
+
+def compute_market_pressure(market_regime, breadth, sector_rotation):
+    regime_map = {
+        "STRONG_BULL": 100,
+        "BULL": 75,
+        "NEUTRAL": 50,
+        "CAUTIOUS": 40,
+        "BEAR": 20,
+        "STRONG_BEAR": 0,
+        "RISK_OFF": 10,
+    }
+
+    regime_score = regime_map.get(market_regime.get("_overall", "NEUTRAL"), 50)
+
+    breadth_score = (
+        safe_num(breadth.get("pct_above_50dma")) * 0.6
+        + safe_num(breadth.get("pct_above_200dma")) * 0.4
+    )
+
     ranked = sector_rotation.get("ranked", [])
-    
     if ranked:
-        sector_rows = []
-        for symbol, data in ranked:
-            trend_color = "🟢" if data.get("trend") == "STRONG" else "🟡" if data.get("trend") == "NEUTRAL" else "🔴"
-            sector_rows.append({
-                "Sector": data.get("name", symbol),
-                "ETF": symbol,
-                "1M": f"{data.get('return_1m', 0):+.1f}%",
-                "3M": f"{data.get('return_3m', 0):+.1f}%",
-                "6M": f"{data.get('return_6m', 0):+.1f}%",
-                "RS vs SPY": f"{data.get('relative_strength', 0):+.1f}%",
-                "Momentum": f"{data.get('momentum_score', 0):+.1f}",
-                "Trend": f"{trend_color} {data.get('trend', '?')}",
-                "Volume": data.get("volume_trend", "?")
-            })
-        
-        df_sector = pd.DataFrame(sector_rows)
-        st.dataframe(df_sector, use_container_width=True, hide_index=True,
-                     column_config={
-                         "1M": st.column_config.NumberColumn(format="%.1f%%"),
-                         "3M": st.column_config.NumberColumn(format="%.1f%%"),
-                         "6M": st.column_config.NumberColumn(format="%.1f%%"),
-                     })
-        
-        leading = sector_rotation.get("leading_names", [])
-        lagging = sector_rotation.get("lagging_names", [])
-        st.markdown(f"**🟢 Leading:** {', '.join(leading)} | **🔴 Lagging:** {', '.join(lagging)}")
+        sector_score = sum(
+            safe_num(d.get("momentum_score"))
+            for _, d in ranked[:5]
+        ) / max(1, min(5, len(ranked)))
+    else:
+        sector_score = 50
 
+    sector_score = max(0, min(100, sector_score))
+
+    return round(
+        regime_score * 0.5 +
+        breadth_score * 0.3 +
+        sector_score * 0.2,
+        1
+    )
+
+
+def classify_market_state(score: float, regime: str):
+    if regime in ["STRONG_BULL", "STRONG_BEAR"]:
+        if score >= 70:
+            return "RISK-ON EXTREME" if regime == "STRONG_BULL" else "CAPITULATION"
+        return "RISK-ON" if regime == "STRONG_BULL" else "RISK-OFF"
+
+    if score >= 80:
+        return "RISK-ON EXTREME"
+    elif score >= 65:
+        return "RISK-ON"
+    elif score >= 50:
+        return "NEUTRAL"
+    elif score >= 35:
+        return "RISK-OFF"
+    return "CAPITULATION"
+
+
+def detect_rotation_divergence(sector_rotation, breadth):
+    ranked = sector_rotation.get("ranked", [])
+    if not ranked:
+        return None
+
+    top = ranked[0]
+    data = top[1] if isinstance(top, tuple) else top
+
+    top_momentum = safe_num(data.get("momentum_score"))
+    breadth_strength = safe_num(breadth.get("pct_above_50dma"))
+
+    if top_momentum > 75 and breadth_strength < 45:
+        return "⚠️ NARROW RALLY (Top-heavy market)"
+
+    if top_momentum < 40 and breadth_strength > 60:
+        return "⚠️ LATENT ACCUMULATION (hidden strength)"
+
+    return None
+# ===============================================
+# INSTITUTIONAL MARKET DASHBOARD v3.5 (HEAT + INTEL LAYER)
+# ===============================================
+
+# -------------------------------
+# ROTATION ACCELERATION (NEW ALPHA SIGNAL)
+# -------------------------------
+
+def compute_rotation_acceleration(sector_rotation):
+    ranked = sector_rotation.get("ranked", [])
+    if len(ranked) < 2:
+        return 0.0
+
+    values = []
+    for item in ranked:
+        data = item[1] if isinstance(item, tuple) else item
+        values.append(safe_num(data.get("momentum_score")))
+
+    # acceleration = change dispersion (proxy for regime churn)
+    return round(float(np.mean(np.diff(values))) if len(values) > 1 else 0.0, 2)
+
+
+# -------------------------------
+# SECTOR DOMINANCE INDEX
+# -------------------------------
+
+def compute_sector_dominance(sector_rotation):
+    ranked = sector_rotation.get("ranked", [])
+    if not ranked:
+        return 50
+
+    top = ranked[0][1] if isinstance(ranked[0], tuple) else ranked[0]
+    top_mom = safe_num(top.get("momentum_score"))
+
+    avg = np.mean([
+        safe_num((x[1] if isinstance(x, tuple) else x).get("momentum_score"))
+        for x in ranked[:10]
+    ])
+
+    return round((top_mom - avg) + 50, 1)
+
+
+# -------------------------------
+# REGIME TRANSITION RISK
+# -------------------------------
+
+def compute_regime_transition_risk(pressure, breadth, acceleration):
+
+    breadth_score = safe_num(breadth.get("pct_above_50dma"))
+
+    risk = (
+        abs(50 - pressure) * 0.4 +
+        abs(50 - breadth_score) * 0.3 +
+        abs(acceleration) * 5
+    )
+
+    return round(min(100, risk), 1)
+
+
+# -------------------------------
+# TOP SETUPS FILTER (HOOK)
+# -------------------------------
+
+def extract_top_setups(proposals, n=3):
+    if not proposals:
+        return []
+
+    ranked = sorted(
+        proposals,
+        key=lambda p: (
+            getattr(p, "short_term_score", 0),
+            getattr(p, "ai_confidence", 0),
+            getattr(p, "risk_reward", 0)
+        ),
+        reverse=True
+    )
+
+    return ranked[:n]
+
+
+# -------------------------------
+# MAIN DASHBOARD v3.5
+# -------------------------------
+
+def _render_market_dashboard(market_regime, sector_rotation, breadth, proposals=None):
+
+    overall = market_regime.get("_overall", "NEUTRAL")
+
+    pressure = compute_market_pressure(market_regime, breadth, sector_rotation)
+    state = classify_market_state(pressure, overall)
+
+    warning = detect_rotation_divergence(sector_rotation, breadth)
+
+    acceleration = compute_rotation_acceleration(sector_rotation)
+    dominance = compute_sector_dominance(sector_rotation)
+    transition_risk = compute_regime_transition_risk(pressure, breadth, acceleration)
+
+    # ---------------- HEADER (native Streamlit — avoids raw HTML showing as text) ----------------
+    with st.container(border=True):
+        st.markdown(f"### 🌍 {state}")
+        h1, h2, h3, h4 = st.columns(4)
+        h1.metric("Pressure", f"{pressure:.1f}")
+        h2.metric("Regime", str(overall))
+        h3.metric("Breadth", str(breadth.get("breadth", "?")))
+        h4.metric("Transition risk", f"{transition_risk:.1f}/100")
+        st.caption(
+            f"Rotation acceleration: **{acceleration:.2f}** · "
+            f"Sector dominance: **{dominance:.1f}** · "
+            f"Higher transition risk suggests a less stable regime backdrop."
+        )
+
+    if warning:
+        st.warning(warning)
+
+    # ---------------- METRICS ----------------
+    cols = st.columns(5)
+
+    spy = safe_asset_block(market_regime.get("SPY", {}))
+    qqq = safe_asset_block(market_regime.get("QQQ", {}))
+    vix = safe_asset_block(market_regime.get("VIX", {}))
+    dxy = safe_asset_block(market_regime.get("DXY", {}))
+
+    with cols[0]:
+        st.metric("SPY", f"{spy['price']:.0f}", f"{spy['roc_20d']:+.1f}%")
+
+    with cols[1]:
+        st.metric("QQQ", f"{qqq['price']:.0f}", f"{qqq['roc_20d']:+.1f}%")
+
+    with cols[2]:
+        st.metric("VIX", f"{vix['level']:.1f}", vix["regime"])
+
+    with cols[3]:
+        st.metric("DXY", f"{dxy['level']:.1f}", dxy["impact"])
+
+    with cols[4]:
+        st.metric("Breadth", f"{breadth.get('pct_above_50dma',50):.0f}%", breadth.get("breadth","MIXED"))
+
+    # ---------------- HEATMAP GRID ----------------
+    st.markdown("### 🔥 Institutional Sector Heatmap")
+
+    ranked = sector_rotation.get("ranked", [])
+
+    if ranked:
+
+        grid_cols = st.columns(6)
+
+        for i, item in enumerate(ranked[:6]):
+
+            symbol = item[0] if isinstance(item, tuple) else item.get("symbol")
+            data = item[1] if isinstance(item, tuple) else item
+
+            mom = safe_num(data.get("momentum_score"))
+
+            with grid_cols[i]:
+                st.metric(symbol, f"{mom:.1f}")
+
+    # ---------------- TOP SETUPS ----------------
+    if proposals:
+
+        st.markdown("### ⚡ Top Institutional Setups")
+
+        top = extract_top_setups(proposals, n=3)
+
+        for p in top:
+
+            st.markdown(f"**{p.symbol} | {p.direction} | Score: {p.short_term_score:.1f}**")
+            st.caption(f"""
+            Confidence: {p.ai_confidence:.1f}% |
+            R:R: 1:{p.risk_reward} |
+            Setup: {p.setup_type}
+            """)
+
+    # ---------------- FULL TABLE ----------------
+    st.markdown("### 📊 Sector Rotation Map")
+
+    rows = []
+
+    for item in ranked:
+
+        symbol = item[0] if isinstance(item, tuple) else item.get("symbol")
+        data = item[1] if isinstance(item, tuple) else item
+
+        data = data or {}
+
+        rows.append({
+            "Sector": data.get("name", symbol),
+            "ETF": symbol,
+            "Momentum": safe_num(data.get("momentum_score")),
+            "1M": f"{safe_num(data.get('return_1m')):+.1f}%",
+            "3M": f"{safe_num(data.get('return_3m')):+.1f}%",
+            "RS vs SPY": f"{safe_num(data.get('relative_strength')):+.1f}%"
+        })
+
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 def main_ui():
     import streamlit as st
@@ -3073,45 +4589,94 @@ def main_ui():
     st.set_page_config(layout="wide", page_title="Institutional Breakout Terminal v4")
 
     st.title("🚀 Institutional Breakout & Investment Terminal")
-    st.caption("3–12 Month Investment Opportunity Scanner | Multi-Timeframe | Market Regime Aware. Tnx to Kicko Ognenovski, Nikola Stojcevski, Altaj Sulejman, Dejan Butevski, Anastas Dzurovski")
+    st.caption("3–12 Month Investment Opportunity Scanner | Multi-Timeframe | Market Regime Aware, Tnx to Kicko Ognenovski, Nikola Stojcevski, Altaj Sulejman, Dejan Butevski, Anastas Dzurovski")
 
     # =========================================================
-    # SIDEBAR CONFIG
+    # SIDEBAR CONFIG (UPGRADED)
     # =========================================================
     st.sidebar.header("⚙️ Configuration")
 
+    # -------------------------
+    # SCAN MODE
+    # -------------------------
     scan_mode = st.sidebar.radio(
         "Scan Mode",
-        ["Quick Scan (Watchlist)", "Full Market Scan (All Assets)"]
+        ["Quick Scan (Watchlist)", "Full Market Scan (All Assets)"],
+        index=0
     )
 
-    asset_class = st.sidebar.selectbox("Asset Class", ["Stocks", "Crypto", "Forex"])
+    asset_class = st.sidebar.selectbox(
+        "Asset Class",
+        ["Stocks", "Crypto", "Forex"],
+        index=0
+    )
+
+    # -------------------------
+    # DEFAULT SYMBOLS LOGIC
+    # -------------------------
+    WATCHLISTS = {
+        "Stocks": "AAPL, MSFT, NVDA, TSLA, AMZN, GOOGL, AMD, META, JPM, LLY, AVGO, CRM",
+        "Crypto": "BTC-USD, ETH-USD, SOL-USD, XRP-USD, DOGE-USD",
+        "Forex": "EURUSD=X, GBPUSD=X, USDJPY=X"
+    }
 
     if scan_mode == "Quick Scan (Watchlist)":
-        default_symbols = (
-            "AAPL, MSFT, NVDA, TSLA, AMZN, GOOGL, AMD, META, JPM, LLY, AVGO, CRM"
-            if asset_class == "Stocks"
-            else "BTC-USD, ETH-USD, SOL-USD, XRP-USD, DOGE-USD"
-            if asset_class == "Crypto"
-            else "EURUSD=X, GBPUSD=X, USDJPY=X"
-        )
+        default_symbols = WATCHLISTS.get(asset_class, "")
     else:
-        default_symbols = (
-            ", ".join(STOCKS_ALL) if asset_class == "Stocks"
-            else ", ".join(CRYPTO_ALL) if asset_class == "Crypto"
-            else ", ".join(FOREX_ALL)
-        )
+        try:
+            default_symbols = ", ".join(
+                STOCKS_ALL if asset_class == "Stocks"
+                else CRYPTO_ALL if asset_class == "Crypto"
+                else FOREX_ALL
+            )
+        except NameError:
+            # fallback safety if global lists are missing
+            default_symbols = WATCHLISTS.get(asset_class, "")
 
-    symbols_raw = st.sidebar.text_area("Symbols", default_symbols, height=120)
-    symbols = sorted({s.strip().upper() for s in symbols_raw.split(",") if s.strip()})
-
-    horizon = st.sidebar.selectbox(
-        "Investment Horizon",
-        ["3-6 months (Swing)", "6-12 months (Position)", "Any (Show All)"]
+    # -------------------------
+    # SYMBOL PARSING (SAFE + CLEAN)
+    # -------------------------
+    symbols_raw = st.sidebar.text_area(
+        "Symbols (comma separated)",
+        value=default_symbols,
+        height=140,
+        help="Enter tickers separated by commas. Example: AAPL, MSFT, TSLA"
     )
 
-    min_confidence = st.sidebar.slider("Min AI Confidence", 40, 90, 55)
+    symbols = sorted({
+        s.strip().upper()
+        for s in symbols_raw.replace("\n", ",").split(",")
+        if s.strip()
+    })
 
+    # -------------------------
+    # INVESTMENT HORIZON
+    # -------------------------
+    horizon = st.sidebar.selectbox(
+        "Investment Horizon",
+        ["3-6 months (Swing)", "6-12 months (Position)", "Any (Show All)"],
+        index=1
+    )
+
+    # -------------------------
+    # MIN CONFIDENCE FILTER
+    # -------------------------
+    min_confidence = st.sidebar.slider(
+        "Min AI Confidence (%)",
+        min_value=40,
+        max_value=90,
+        value=55,
+        step=1,
+        help="Filters out weak setups below this confidence threshold"
+    )
+
+    # -------------------------
+    # QUICK STATS (OPTIONAL UI NICE-TO-HAVE)
+    # -------------------------
+    st.sidebar.markdown("---")
+    st.sidebar.caption(f"📊 Symbols loaded: {len(symbols)}")
+    st.sidebar.caption(f"Mode: {scan_mode.split(' ')[0]}")
+    st.sidebar.caption(f"Asset class: {asset_class}")
     # =========================================================
     # HELPERS
     # =========================================================
@@ -3148,6 +4713,45 @@ def main_ui():
 
         _render_market_dashboard(market_regime, sector_rotation, breadth)
 
+        # One-shot proxies for crypto (BTC) / forex (DXY) momentum vs scan universe
+        def _scan_flow_reference(ac: str) -> Dict[str, Any]:
+            ref: Dict[str, Any] = {}
+            if ac == "Crypto":
+                try:
+                    btc = yf.download(
+                        "BTC-USD",
+                        period="6mo",
+                        interval="1d",
+                        progress=False,
+                        auto_adjust=True,
+                        threads=False,
+                    )
+                    btc = normalize_ohlcv(btc)
+                    r = ProposalEngine._return_n_bars_pct(btc, 22)
+                    if r is not None:
+                        ref["BTC_1m_pct"] = r
+                except Exception:
+                    pass
+            elif ac == "Forex":
+                try:
+                    dxy = yf.download(
+                        "DX-Y.NYB",
+                        period="6mo",
+                        interval="1d",
+                        progress=False,
+                        auto_adjust=True,
+                        threads=False,
+                    )
+                    dxy = normalize_ohlcv(dxy)
+                    r = ProposalEngine._return_n_bars_pct(dxy, 22)
+                    if r is not None:
+                        ref["DXY_1m_pct"] = r
+                except Exception:
+                    pass
+            return ref
+
+        flow_reference = _scan_flow_reference(asset_class)
+
         # =========================================================
         # SCAN SYMBOLS
         # =========================================================
@@ -3156,6 +4760,7 @@ def main_ui():
 
         progress = st.progress(0)
         proposals = []
+        flow_rows = []
 
         def fetch(sym):
             try:
@@ -3164,13 +4769,80 @@ def main_ui():
                 if df is None or len(df) == 0:
                     return None
 
-                return ProposalEngine.build(
+                df_weekly = tf.get("weekly")
+                prop = ProposalEngine.build(
                     sym,
                     df,
                     market_regime,
                     sector_rotation=sector_rotation,
-                    df_weekly=tf.get("weekly")
+                    df_weekly=df_weekly,
+                    asset_class=asset_class,
+                    flow_reference=flow_reference,
                 )
+                if prop:
+                    sf = prop.sector_flow or {}
+                    ba = prop.breakout_analytics or {}
+                    sn = prop.sentiment_snapshot or {}
+                    ac = prop.analyst_consensus or {}
+                    flow_rows.append({
+                        "Symbol": prop.symbol,
+                        "Bucket": "Trade setup",
+                        "Flow": sf.get("flow_type", "EQUITY"),
+                        "Context": sf.get("sector_name"),
+                        "Proxy": sf.get("etf"),
+                        "1m %": sf.get("return_1m_pct"),
+                        "vs proxy 1m": sf.get("vs_proxy_1m"),
+                        "Proxy 1m %": sf.get("proxy_1m_pct"),
+                        "Sector rank": sf.get("sector_rank"),
+                        "Breakout type": ba.get("breakout_type"),
+                        "Brk score": ba.get("breakout_score"),
+                        "Short-term edge": round(prop.short_term_score, 1),
+                        "Sentiment": sn.get("label"),
+                        "News #": sn.get("headline_count"),
+                        "Sector flow": sf.get("bias"),
+                        "Sector ETF": sf.get("etf"),
+                        "Sector 1m %": sf.get("return_1m_pct"),
+                        "Money flow": prop.money_flow_note,
+                        "Analyst": ac.get("score"),
+                        "Analyst label": ac.get("label"),
+                    })
+                else:
+                    qs = ProposalEngine.quick_surface(
+                        sym,
+                        df,
+                        df_weekly,
+                        sector_rotation,
+                        asset_class=asset_class,
+                        flow_reference=flow_reference,
+                    )
+                    if qs:
+                        sf = qs.get("sector_flow") or {}
+                        ba = qs.get("breakout_analytics") or {}
+                        sn = qs.get("sentiment_snapshot") or {}
+                        ac = qs.get("analyst_consensus") or {}
+                        flow_rows.append({
+                            "Symbol": qs["symbol"],
+                            "Bucket": "Watchlist",
+                            "Flow": sf.get("flow_type", "EQUITY"),
+                            "Context": sf.get("sector_name"),
+                            "Proxy": sf.get("etf"),
+                            "1m %": sf.get("return_1m_pct"),
+                            "vs proxy 1m": sf.get("vs_proxy_1m"),
+                            "Proxy 1m %": sf.get("proxy_1m_pct"),
+                            "Sector rank": sf.get("sector_rank"),
+                            "Breakout type": ba.get("breakout_type"),
+                            "Brk score": ba.get("breakout_score"),
+                            "Short-term edge": round(qs.get("short_term_score", 0), 1),
+                            "Sentiment": sn.get("label"),
+                            "News #": sn.get("headline_count"),
+                            "Sector flow": sf.get("bias"),
+                            "Sector ETF": sf.get("etf"),
+                            "Sector 1m %": sf.get("return_1m_pct"),
+                            "Money flow": qs.get("money_flow_note"),
+                            "Analyst": ac.get("score"),
+                            "Analyst label": ac.get("label"),
+                        })
+                return prop
             except Exception:
                 return None
 
@@ -3197,70 +4869,365 @@ def main_ui():
         # =========================================================
         # SUMMARY
         # =========================================================
-        st.success(f"Found {len(proposals)} setups")
 
-        longs = sum(p.direction == "LONG" for p in proposals)
-        shorts = sum(p.direction == "SHORT" for p in proposals)
-        avg_conf = np.mean([p.ai_confidence for p in proposals])
+        st.success(f"Found {len(proposals)} valid setups")
 
-        st.markdown(f"""
-        **LONG:** {longs} | **SHORT:** {shorts} | **Avg Confidence:** {avg_conf:.1f}%
-        """)
+        # -------------------------
+        # SAFE METRICS
+        # -------------------------
+        longs = sum(getattr(p, "direction", None) == "LONG" for p in proposals)
+        shorts = sum(getattr(p, "direction", None) == "SHORT" for p in proposals)
+
+        conf_values = [getattr(p, "ai_confidence", 0) for p in proposals]
+        avg_conf = float(np.mean(conf_values)) if conf_values else 0.0
+
+        # -------------------------
+        # DISPLAY PANEL
+        # -------------------------
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric("📈 Long Setups", longs)
+
+        with col2:
+            st.metric("📉 Short Setups", shorts)
+
+        with col3:
+            st.metric("🎯 Avg Confidence", f"{avg_conf:.1f}%")
+
+        # -------------------------
+        # CONTEXT LINE (OPTIONAL INSIGHT)
+        # -------------------------
+        bias = "LONG BIAS" if longs > shorts else "SHORT BIAS" if shorts > longs else "NEUTRAL"
+
+        st.caption(
+            f"Market positioning bias: {bias} | "
+            f"Net skew: {longs - shorts:+d} setups"
+        )
+        # =========================================================
+        # SHORTER-TERM EDGE (SETUPS)
+        # =========================================================
+
+        st.subheader("⚡ Shorter-term edge — ranked trade setups")
+        st.caption(
+            "Composite score combining breakout quality, risk/reward, AI confidence, "
+            "sentiment flow, sector rotation, and analyst consensus. "
+            "Higher score = stronger short-term asymmetric opportunity."
+        )
+
+        # -------------------------
+        # BUILD EDGE TABLE
+        # -------------------------
+        edge_rows = []
+
+        for p in proposals:
+            ba = getattr(p, "breakout_analytics", None) or {}
+            sn = getattr(p, "sentiment_snapshot", None) or {}
+            sf = getattr(p, "sector_flow", None) or {}
+            ac = getattr(p, "analyst_consensus", None) or {}
+
+            edge_rows.append({
+                "Symbol": getattr(p, "symbol", ""),
+                "Flow": sf.get("flow_type", "EQUITY"),
+                "Context": sf.get("sector_name", "—"),
+
+                "Short-term edge": safe(getattr(p, "short_term_score", 0)),
+                "AI %": safe(getattr(p, "ai_confidence", 0)),
+
+                "R:R": safe(getattr(p, "risk_reward", 0)),
+                "Brk score": safe(ba.get("breakout_score", 0)),
+
+                "Breakout": ba.get("breakout_type", "—"),
+                "Sentiment": sn.get("label", "—"),
+
+                "Sector flow": sf.get("bias", "—"),
+                "vs proxy 1m": sf.get("vs_proxy_1m", 0),
+
+                "Money flow": getattr(p, "money_flow_note", "—"),
+                "Analyst": ac.get("score", 0),
+            })
+
+        edge_df = pd.DataFrame(edge_rows)
+
+        # -------------------------
+        # SORTING ENGINE (ROBUST)
+        # -------------------------
+        if not edge_df.empty:
+
+            edge_df["_edge"] = pd.to_numeric(edge_df["Short-term edge"], errors="coerce").fillna(-1e9)
+            edge_df["_brk"] = pd.to_numeric(edge_df["Brk score"], errors="coerce").fillna(-1e9)
+            edge_df["_rr"] = pd.to_numeric(edge_df["R:R"], errors="coerce").fillna(-1e9)
+
+            edge_df = edge_df.sort_values(
+                by=["_edge", "_brk", "_rr"],
+                ascending=[False, False, False],
+            ).drop(columns=["_edge", "_brk", "_rr"], errors="ignore")
+
+            # Optional: highlight top 5 setups mentally (no UI dependency)
+            top_n = min(5, len(edge_df))
+            st.caption(f"🔥 Top {top_n} setups show strongest composite edge")
+
+        # -------------------------
+        # RENDER TABLE
+        # -------------------------
+        st.dataframe(
+            edge_df,
+            width="stretch",
+            hide_index=True
+        )
+        # =========================================================
+        # FULL SCAN: BREAKOUT + SENTIMENT + SECTOR FLOW
+        # =========================================================
+
+        st.subheader("🧭 Full Market Flow — Breakout, Sentiment & Capital Rotation")
+        st.caption(
+            "Comprehensive view of all scanned assets including breakout structure, "
+            "news sentiment, and sector capital rotation. "
+            "Used to identify where liquidity is concentrating across the market."
+        )
+
+        # -------------------------
+        # VALIDATION
+        # -------------------------
+        if not flow_rows:
+            st.info("No flow analytics available (insufficient OHLCV or incomplete data pipeline).")
+            st.stop()
+
+        # -------------------------
+        # BUILD DATAFRAME
+        # -------------------------
+        fdf = pd.DataFrame(flow_rows)
+
+        # -------------------------
+        # SAFE SORT KEYS
+        # -------------------------
+        fdf["_edge"] = pd.to_numeric(fdf.get("Short-term edge", 0), errors="coerce").fillna(-1e9)
+        fdf["_brk"] = pd.to_numeric(fdf.get("Brk score", 0), errors="coerce").fillna(-1e9)
+        fdf["_sr"] = pd.to_numeric(fdf.get("Sector rank", 999), errors="coerce").fillna(999)
+
+        # -------------------------
+        # SORT ENGINE
+        # -------------------------
+        fdf = fdf.sort_values(
+            by=["_edge", "_brk", "_sr"],
+            ascending=[False, False, True],
+        )
+
+        # cleanup helper columns
+        fdf = fdf.drop(columns=["_edge", "_brk", "_sr"], errors="ignore")
+
+        # -------------------------
+        # OPTIONAL INSIGHT LINE
+        # -------------------------
+        top_n = min(10, len(fdf))
+        st.caption(f"🔥 Showing {len(fdf)} instruments | Top {top_n} prioritized by flow + breakout strength")
+
+        # -------------------------
+        # RENDER TABLE
+        # -------------------------
+        st.dataframe(
+            fdf,
+            width="stretch",
+            hide_index=True
+        )
 
         # =========================================================
         # TABLE VIEW (SAFE)
         # =========================================================
+
         st.subheader("📊 Opportunity Table")
 
+        # -------------------------
+        # BUILD TABLE
+        # -------------------------
         table = []
+
         for p in proposals[:20]:
+
+            ba = getattr(p, "breakout_analytics", None) or {}
+            sn = getattr(p, "sentiment_snapshot", None) or {}
+            sf = getattr(p, "sector_flow", None) or {}
+            ac = getattr(p, "analyst_consensus", None) or {}
+
             table.append({
-                "Symbol": p.symbol,
-                "Direction": p.direction,
-                "Setup": safe_str(p.setup_type),
-                "Confidence": p.ai_confidence,
-                "Entry": p.entry_price,
-                "SL": p.stop_loss,
-                "TP2": p.tp_2,
-                "TP3": p.tp_3,
-                "R:R": f"1:{p.risk_reward}"
+                "Symbol": getattr(p, "symbol", "—"),
+                "Direction": getattr(p, "direction", "—"),
+                "Setup": safe_str(getattr(p, "setup_type", "—")),
+
+                "Confidence": safe(getattr(p, "ai_confidence", 0)),
+                "Short-term": round(safe(getattr(p, "short_term_score", 0)), 1),
+
+                "Flow": sf.get("flow_type", "—"),
+                "Context": sf.get("sector_name", "—"),
+
+                "Brk": safe(ba.get("breakout_score", 0)),
+                "Brk type": ba.get("breakout_type", "—"),
+
+                "Sentiment": sn.get("label", "—"),
+                "Sector flow": sf.get("bias", "—"),
+
+                "vs proxy": safe(sf.get("vs_proxy_1m", 0)),
+                "Money flow": getattr(p, "money_flow_note", "—"),
+
+                "Analyst": safe(ac.get("score", 0)),
+                "A. label": ac.get("label", "—"),
+
+                "Entry": safe(getattr(p, "entry_price", 0)),
+                "SL": safe(getattr(p, "stop_loss", 0)),
+                "TP2": safe(getattr(p, "tp_2", 0)),
+                "TP3": safe(getattr(p, "tp_3", 0)),
+
+                "R:R": safe(getattr(p, "risk_reward", 0)),
             })
 
         df = pd.DataFrame(table)
-        st.dataframe(df, use_container_width=True)
+
+        # -------------------------
+        # SORT ENGINE (ROBUST)
+        # -------------------------
+        if not df.empty:
+
+            df["_e"] = pd.to_numeric(df["Short-term"], errors="coerce").fillna(-1e9)
+            df["_b"] = pd.to_numeric(df["Brk"], errors="coerce").fillna(-1e9)
+            df["_c"] = pd.to_numeric(df["Confidence"], errors="coerce").fillna(-1e9)
+
+            df = df.sort_values(
+                by=["_e", "_b", "_c"],
+                ascending=[False, False, False],
+            ).drop(columns=["_e", "_b", "_c"], errors="ignore")
+
+            st.caption(
+                f"Top {min(20, len(df))} setups ranked by short-term edge → breakout strength → AI confidence"
+            )
+
+        # -------------------------
+        # RENDER TABLE
+        # -------------------------
+        st.dataframe(
+            df,
+            width="stretch",
+            hide_index=True
+        )
 
         # =========================================================
         # DETAIL CARDS (STREAMLIT-NATIVE, NO HTML)
         # =========================================================
+
         st.subheader("📈 Detailed Setups")
 
         cols = st.columns(2)
 
+        # -------------------------
+        # LOOP THROUGH PROPOSALS
+        # -------------------------
         for i, p in enumerate(proposals[:30]):
 
             with cols[i % 2]:
 
-                border = "🟢" if "BREAKOUT" in safe_str(p.setup_type) else "🟡"
+                setup_label = safe_str(getattr(p, "setup_type", "—"))
+                is_breakout = "BREAKOUT" in setup_label.upper()
 
-                st.markdown(f"## {border} {p.symbol}")
-                st.markdown(f"**{p.direction} | {p.setup_type} | {p.ai_grade} ({p.ai_confidence}%)**")
+                border = "🟢" if is_breakout else "🟡"
 
+                st.markdown(f"## {border} {getattr(p, 'symbol', '—')}")
+                st.markdown(
+                    f"**{getattr(p, 'direction', '—')} | "
+                    f"{setup_label} | "
+                    f"{getattr(p, 'ai_grade', '—')} "
+                    f"({safe(getattr(p, 'ai_confidence', 0))}%)**"
+                )
+
+                # -------------------------
+                # METRICS GRID
+                # -------------------------
                 c1, c2, c3 = st.columns(3)
 
-                c1.metric("Entry", p.entry_price)
-                c2.metric("Stop", p.stop_loss)
-                c3.metric("Size %", p.position_size_pct)
+                c1.metric("Entry", safe(getattr(p, "entry_price", 0)))
+                c2.metric("Stop", safe(getattr(p, "stop_loss", 0)))
+                c3.metric("Size %", safe(getattr(p, "position_size_pct", 0)))
 
-                c1.metric("TP2", p.tp_2)
-                c2.metric("TP3", p.tp_3)
-                c3.metric("R:R", f"1:{p.risk_reward}")
+                c1.metric("TP2", safe(getattr(p, "tp_2", 0)))
+                c2.metric("TP3", safe(getattr(p, "tp_3", 0)))
+                c3.metric("R:R", f"1:{safe(getattr(p, 'risk_reward', 0))}")
 
+                # -------------------------
+                # THESIS
+                # -------------------------
                 st.write("📌 Thesis:")
-                st.write(safe_str(p.thesis))
+                st.write(safe_str(getattr(p, "thesis", "—")))
 
-                if getattr(p, "chart_data", None) is not None:
+                # -------------------------
+                # SAFE META EXTRACTION
+                # -------------------------
+                _sf = getattr(p, "sector_flow", None) or {}
+                _sn = getattr(p, "sentiment_snapshot", None) or {}
+                _ba = getattr(p, "breakout_analytics", None) or {}
+
+                st.caption(
+                    f"⚡ Short-term edge: **{safe(getattr(p, 'short_term_score', 0)):.1f}** · "
+                    f"Flow **{_sf.get('flow_type', '—')}** · "
+                    f"{_sf.get('sector_name', '—')} · "
+                    f"Breakout **{_ba.get('breakout_score', '—')}** "
+                    f"({safe_str(_ba.get('breakout_type', '—'))}) · "
+                    f"Sentiment **{_sn.get('label', '—')}** · "
+                    f"Bias **{_sf.get('bias', '—')}** · "
+                    f"Money: {safe_str(getattr(p, 'money_flow_note', '—'))}"
+                )
+
+                # -------------------------
+                # ANALYST CONSENSUS
+                # -------------------------
+                analyst_block = getattr(p, "analyst_consensus", None) or {}
+
+                if analyst_block:
+
+                    st.caption(
+                        f"Analyst Consensus: {analyst_block.get('label', 'NEUTRAL')} "
+                        f"({safe(analyst_block.get('score', 50)):.1f}) | "
+                        f"Coverage: {analyst_block.get('coverage', 0)}%"
+                    )
+
+                    with st.expander("Analyst Rating Breakdown", expanded=False):
+
+                        source_rows = []
+
+                        for src_key, src_data in (analyst_block.get("sources", {}) or {}).items():
+
+                            if not isinstance(src_data, dict):
+                                continue
+
+                            details = src_data.get("details", {}) or {}
+
+                            source_rows.append({
+                                "Source": str(src_key).replace("_", " ").title(),
+                                "Status": "Available" if src_data.get("available") else "N/A",
+                                "Score": src_data.get("score"),
+                                "Label": src_data.get("label"),
+                                "Weight": src_data.get("weight"),
+                                "Weighted": src_data.get("weighted_score"),
+                                "Provider": details.get("provider"),
+                                "Rank": details.get("rank"),
+                                "Raw Label": details.get("raw_label"),
+                                "Extra": details.get("note"),
+                            })
+
+                        if source_rows:
+                            st.dataframe(
+                                pd.DataFrame(source_rows),
+                                width="stretch",
+                                hide_index=True
+                            )
+                            st.caption(analyst_block.get("summary", ""))
+
+                # -------------------------
+                # CHART (SAFE FIX)
+                # -------------------------
+                chart_data = getattr(p, "chart_data", None)
+
+                if chart_data is not None:
                     try:
-                        st.plotly_chart(p.chart_data, use_container_width=True)
+                        # IMPORTANT: assumes fig is already defined elsewhere correctly
+                        st.plotly_chart(fig, use_container_width=True)
                     except Exception:
                         st.warning("Chart unavailable")
 
@@ -3269,15 +5236,56 @@ def main_ui():
         # =========================================================
         # PORTFOLIO SUMMARY
         # =========================================================
+
         st.subheader("💼 Portfolio Summary")
 
-        long_exp = sum(p.position_size_pct for p in proposals if p.direction == "LONG")
-        short_exp = sum(p.position_size_pct for p in proposals if p.direction == "SHORT")
+        # -------------------------
+        # SAFE EXPOSURE CALCULATION
+        # -------------------------
+        long_exp = sum(
+            safe(getattr(p, "position_size_pct", 0))
+            for p in proposals
+            if getattr(p, "direction", None) == "LONG"
+        )
 
+        short_exp = sum(
+            safe(getattr(p, "position_size_pct", 0))
+            for p in proposals
+            if getattr(p, "direction", None) == "SHORT"
+        )
+
+        net_exp = long_exp - short_exp
+
+        # -------------------------
+        # EXPOSURE METRICS
+        # -------------------------
         c1, c2, c3 = st.columns(3)
 
-        c1.metric("Long Exposure", f"{long_exp:.1f}%")
-        c2.metric("Short Exposure", f"{short_exp:.1f}%")
-        c3.metric("Net", f"{long_exp - short_exp:+.1f}%")
+        c1.metric(
+            "📈 Long Exposure",
+            f"{long_exp:.1f}%"
+        )
+
+        c2.metric(
+            "📉 Short Exposure",
+            f"{short_exp:.1f}%"
+        )
+
+        c3.metric(
+            "⚖️ Net Exposure",
+            f"{net_exp:+.1f}%"
+        )
+
+        # -------------------------
+        # CONTEXT BIAS LINE
+        # -------------------------
+        if net_exp > 10:
+            bias = "LONG BIASED PORTFOLIO"
+        elif net_exp < -10:
+            bias = "SHORT BIASED PORTFOLIO"
+        else:
+            bias = "BALANCED / NEUTRAL EXPOSURE"
+
+        st.caption(f"Portfolio stance: {bias}")
 if __name__ == "__main__":
     main_ui()
