@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple
+from types import SimpleNamespace
 
 
 
@@ -1239,7 +1240,7 @@ class BreakoutEngine:
         df_weekly: Optional[pd.DataFrame] = None,
     ) -> Dict[str, Any]:
 
-        if df is None or len(df) < 80:
+        if df is None or len(df) < 60:
             return {
                 "status": "NO_DATA",
             }
@@ -2076,6 +2077,9 @@ class FundamentalEngine:
             beta = info.get("beta", 1.0) or 1.0
             market_cap = info.get("marketCap", 0) or 0
             debt_to_equity = info.get("debtToEquity", 0) or 0
+            # Additional fundamentals for quality scoring
+            roe = info.get("returnOnEquity", 0) or 0
+            net_income = info.get("netIncomeToCommon", 0) or info.get("netIncome", 0) or 0
             
             # 52-week range
             week52_high = info.get("fiftyTwoWeekHigh", 0) or 0
@@ -2120,6 +2124,50 @@ class FundamentalEngine:
             if rec in ["strong_buy", "buy"]: score += 5
             elif rec in ["strong_sell", "sell"]: score -= 8
 
+            # --- Buffett-style quality score ---
+            buffett = BuffettAnalyzer.analyze(info)
+            buffett_score = buffett["buffett_score"]
+
+            # --- Piotroski F-Score (0-9) ---
+            # Simplified checks (no full balance sheet history available)
+            f_score = 0
+            try:
+                # Profitability
+                if net_income and net_income > 0:
+                    f_score += 1
+                if info.get("operatingCashflow", 0) > 0:
+                    f_score += 1
+                if roe and roe > 0.10:
+                    f_score += 1
+                # Leverage / Liquidity
+                if info.get("debtToEquity", 999) < 0.5:
+                    f_score += 1
+                if info.get("currentRatio", 0) > 1.0:
+                    f_score += 1
+                # Operating efficiency (ROA improvement proxy)
+                if roe and roe > 0.12:
+                    f_score += 1
+            except Exception:
+                pass
+
+            # --- Altman Z-Score (approximation) ---
+            z_score = None
+            try:
+                ta = info.get("totalAssets") or 1e9
+                wc = (info.get("totalCurrentAssets", 0) or 0) - (info.get("totalCurrentLiabilities", 0) or 0)
+                x1 = wc / ta
+                x2 = (info.get("retainedEarnings", 0) or 0) / ta
+                ebit = (info.get("ebit", 0) or 0)
+                x3 = ebit / ta
+                tde = (info.get("totalDebt", 0) or 0)
+                x4 = ((info.get("marketCap", 0) or 1) / (tde or 1))
+                rev = (info.get("totalRevenue", 0) or 0)
+                x5 = rev / ta
+                z = 1.2 * x1 + 1.4 * x2 + 3.3 * x3 + 0.6 * x4 + 1.0 * x5
+                z_score = float(z)
+            except Exception:
+                z_score = None
+
             return {
                 "score": min(100, max(0, score)),
                 "pe": round(pe, 2),
@@ -2133,7 +2181,21 @@ class FundamentalEngine:
                 "debt_to_equity": debt_to_equity,
                 "near_52w_high": near_52w_high,
                 "dist_from_52w_high": round(dist_from_high, 2),
-                "analyst_rec": rec
+                "analyst_rec": rec,
+                # Buffett / Munger quality
+                "buffett_score": buffett_score,
+                "buffett_rating": buffett["buffett_rating"],
+                "piotroski_f": f_score,
+                "altman_z": round(z_score, 2) if z_score else None,
+                # Additional fields needed by BuffettAnalyzer
+                "roe": roe,
+                "eps_growth": growth * 100,
+                "free_cashflow": info.get("freeCashflow"),
+                "current_price": info.get("currentPrice"),
+                "target_mean_price": info.get("targetMeanPrice"),
+                "held_percent_insiders": info.get("heldPercentInsiders"),
+                "held_percent_institutions": info.get("heldPercentInstitutions"),
+                "operating_margin": profit_margin,
             }
         except Exception as e:
             logger.debug(f"Fundamentals failed for {symbol}: {e}")
@@ -2141,7 +2203,149 @@ class FundamentalEngine:
 
 
 # ===============================================
-# 8. SENTIMENT ENGINE
+# 8. BUFFETT / MUNGER QUALITY ANALYZER
+# ===============================================
+
+class BuffettAnalyzer:
+    """
+    Institutional-quality fundamental scoring inspired by Warren Buffett.
+    Nine pillars: ROE, Debt, EPS Growth, FCF, Operating Margin, P/E,
+    Competitive Moat, Management Quality, Intrinsic Value Margin.
+    Returns total 0-100 score + per-pillar breakdown +Rating.
+    """
+
+    @staticmethod
+    def _safe_float(value, default=0.0):
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except Exception:
+            return default
+
+    @classmethod
+    def analyze(cls, info: Dict[str, Any]) -> Dict[str, Any]:
+        scores = {}
+
+        # --- 1. ROE ---
+        roe = cls._safe_float(info.get("returnOnEquity"))
+        if roe >= 0.20:
+            scores["roe"] = 10
+        elif roe >= 0.15:
+            scores["roe"] = 8
+        elif roe >= 0.10:
+            scores["roe"] = 5
+        else:
+            scores["roe"] = 0
+
+        # --- 2. Debt-to-Equity ---
+        dte = cls._safe_float(info.get("debtToEquity"))
+        if dte < 0.3:
+            scores["debt"] = 10
+        elif dte < 0.5:
+            scores["debt"] = 8
+        elif dte < 1.0:
+            scores["debt"] = 5
+        else:
+            scores["debt"] = 0
+
+        # --- 3. EPS Growth (YoY) ---
+        eps_g = cls._safe_float(info.get("earningsQuarterlyGrowth"), 0) * 100
+        if eps_g > 15:
+            scores["eps_growth"] = 10
+        elif eps_g > 10:
+            scores["eps_growth"] = 8
+        elif eps_g > 5:
+            scores["eps_growth"] = 5
+        else:
+            scores["eps_growth"] = 0
+
+        # --- 4. Free Cash Flow (positive) ---
+        fcf = cls._safe_float(info.get("freeCashflow"))
+        scores["fcf"] = 10 if fcf > 0 else 0
+
+        # --- 5. Operating Margin ---
+        op_margin = cls._safe_float(info.get("profitMargins"))
+        if op_margin > 0.25:
+            scores["margin"] = 10
+        elif op_margin > 0.15:
+            scores["margin"] = 7
+        elif op_margin > 0.10:
+            scores["margin"] = 5
+        else:
+            scores["margin"] = 0
+
+        # --- 6. P/E Ratio ---
+        pe = cls._safe_float(info.get("forwardPE"))
+        if pe < 15:
+            scores["pe"] = 10
+        elif pe < 25:
+            scores["pe"] = 7
+        elif pe < 35:
+            scores["pe"] = 4
+        else:
+            scores["pe"] = 0
+
+        # --- 7. Competitive Moat (durability proxy) ---
+        moat_score = 0
+        if roe > 0.15 and op_margin > 0.15 and eps_g > 5:
+            moat_score = 10  # durable competitive advantages
+        elif roe > 0.12 and op_margin > 0.10:
+            moat_score = 6
+        else:
+            moat_score = 2
+        scores["moat"] = moat_score
+
+        # --- 8. Management Quality (insider + institutional ownership) ---
+        mgmt_score = 0
+        inst_held = cls._safe_float(info.get("heldPercentInstitutions"))
+        ins_held = cls._safe_float(info.get("heldPercentInsiders"))
+        if ins_held > 0.1 or inst_held > 0.7:
+            mgmt_score = 10  # strong alignment
+        elif ins_held > 0.05 or inst_held > 0.5:
+            mgmt_score = 6
+        else:
+            mgmt_score = 3
+        scores["management"] = mgmt_score
+
+        # --- 9. Intrinsic Value Margin (analyst target vs current) ---
+        current_price = cls._safe_float(info.get("currentPrice"))
+        target_price = cls._safe_float(info.get("targetMeanPrice"))
+        if current_price > 0 and target_price and target_price > 0:
+            margin = (target_price - current_price) / current_price
+            if margin > 0.40:
+                scores["intrinsic"] = 10
+            elif margin > 0.25:
+                scores["intrinsic"] = 8
+            elif margin > 0.10:
+                scores["intrinsic"] = 5
+            else:
+                scores["intrinsic"] = 0
+        else:
+            scores["intrinsic"] = 0
+
+        total = sum(scores.values())
+
+        return {
+            "buffett_score": round(total, 2),
+            "buffett_max": 90.0,
+            "buffett_rating": cls._rating(total),
+            "pillars": scores,
+        }
+
+    @staticmethod
+    def _rating(total_score: float) -> str:
+        if total_score >= 75:
+            return "STRONG BUY"
+        if total_score >= 60:
+            return "BUY"
+        if total_score >= 45:
+            return "HOLD"
+        return "AVOID"
+
+
+# ===============================================
+# 9. SENTIMENT ENGINE
 # ===============================================
 
 class SentimentEngine:
@@ -2192,7 +2396,11 @@ class AIEnsemble:
     """
 
     @staticmethod
-    def predict(features: Dict, market_regime: Dict = None) -> Dict:
+    def predict(
+        features: Dict,
+        market_regime: Dict = None,
+        ml_forecast: Dict = None,
+    ) -> Dict:
         score = 50
         signals = []  # Track individual signal sources
         weights = {}  # Track weights for transparency
@@ -2211,8 +2419,8 @@ class AIEnsemble:
 
         # --- 2. BREAKOUT (Weight: 30) ---
         breakout = features.get("breakout_type")
-        aligned = features.get("structure_aligned", False)
-        htf_aligned = features.get("htf_aligned", False)
+        aligned = features.get("smc_alignment", False)
+        htf_aligned = features.get("higher_timeframe_alignment", False)
         breakout_strength = features.get("breakout_strength", 0)
         
         breakout_score = 0
@@ -2242,11 +2450,12 @@ class AIEnsemble:
         # --- 3. SQUEEZE (Weight: 8) ---
         if features.get("squeeze_detected"):
             squeeze_bonus = 8
-            if features.get("squeeze_days", 0) > 10:
+            squeeze_duration = features.get("squeeze_duration", 0)
+            if squeeze_duration > 10:
                 squeeze_bonus += 4  # Extended squeeze = more energy
             weights["squeeze"] = squeeze_bonus
             score += squeeze_bonus
-            signals.append(f"Volatility squeeze ({features.get('squeeze_days', 0)} days)")
+            signals.append(f"Volatility squeeze ({squeeze_duration} days)")
 
         # --- 4. MACD (Weight: 10) ---
         macd_cross = features.get("macd_cross", "NONE")
@@ -2298,7 +2507,7 @@ class AIEnsemble:
         elif features.get("obv_bearish_divergence"):
             flow_score -= 4
             signals.append("OBV bearish divergence")
-        if features.get("vol_above_avg"):
+        if features.get("volume_confirmed"):
             flow_score += 2
         weights["flow"] = flow_score
         score += flow_score
@@ -2340,7 +2549,14 @@ class AIEnsemble:
         weights["sentiment"] = round(sent_adjust, 1)
         score += sent_adjust
 
-        # --- 12. Market Regime Filter (Weight: Variable) ---
+        # --- 12. Buffett Quality Score (Weight: 15) ---
+        quality_score_val = features.get("fundamental_quality", 50)  # 0-90 scale
+        quality_edge = (quality_score_val - 45) * 0.35  # 45→0, 90→+15.75 capped
+        quality_edge = max(-12.0, min(15.0, quality_edge))
+        weights["quality"] = round(quality_edge, 1)
+        score += quality_edge
+
+        # --- 13. Market Regime Filter (Weight: Variable) ---
         regime_adjust = 0
         if market_regime:
             bias = market_regime.get("_bias", {})
@@ -2361,15 +2577,133 @@ class AIEnsemble:
         weights["regime"] = round(regime_adjust, 1)
         score += regime_adjust
 
+        # --- 13. ORDER-FLOW PROXY (Tape / Bar Microstructure) ---
+        of_score = 0.0
+        try:
+            # Core metrics
+            imb = float(features.get("of_imbalance", 0.5) or 0.5)
+            imb_20 = float(features.get("of_imbalance_20", 0.5) or 0.5)
+            delta_trend = features.get("of_delta_trend", "NEUTRAL")
+            absorption = features.get("of_absorption_flag", False)
+            absorption_strength = float(features.get("of_absorption_strength", 0.0) or 0.0)
+            inst_footprint = features.get("of_institutional_footprint", "NEUTRAL")
+            liquidity_grab = features.get("of_liquidity_grab", False)
+            stop_run = features.get("of_stop_run", False)
+            bias_lbl = features.get("of_bias", "NEUTRAL")
+            delta_pos = features.get("of_delta_positive", False)
+
+            # Base imbalance scoring (short-term pressure)
+            of_score = (imb - 0.5) * 14.0
+
+            # Trend-stacked imbalance (medium-term pressure)
+            if imb_20 > 0.56:
+                of_score += 6.0  # Sustained buying pressure
+                signals.append(f"Imbalance 20-bar: {imb_20:.2f} (bullish)")
+            elif imb_20 < 0.44:
+                of_score -= 6.0  # Sustained selling pressure
+                signals.append(f"Imbalance 20-bar: {imb_20:.2f} (bearish)")
+
+            # Delta trend acceleration
+            if delta_trend == "BULLISH_ACCELERATING":
+                of_score += 5.0
+                signals.append("Delta acceleration BULLISH")
+            elif delta_trend == "BEARISH_ACCELERATING":
+                of_score -= 5.0
+                signals.append("Delta acceleration BEARISH")
+            elif delta_trend == "BULLISH_DECELERATING":
+                of_score += 2.0
+                signals.append("Delta decelerating (bullish)")
+            elif delta_trend == "BEARISH_DECELERATING":
+                of_score -= 2.0
+                signals.append("Delta decelerating (bearish)")
+
+            # Absorption quality
+            if absorption:
+                inst_add = 0.0
+                if inst_footprint == "HEAVY":
+                    inst_add = 5.0
+                    signals.append("Heavy institutional footprint + absorption")
+                elif inst_footprint == "MODERATE":
+                    inst_add = 3.0
+                    signals.append("Moderate institutional footprint")
+                else:
+                    inst_add = 1.5
+                of_score += inst_add if bias_lbl == "BULLISH" else -inst_add
+
+            # Liquidity grab / stop run
+            if liquidity_grab:
+                if stop_run:
+                    of_score += 3.0 if bias_lbl == "BULLISH" else -3.0
+                    signals.append("Stop-run detected (institutional sweep)")
+                else:
+                    of_score += 1.5 if bias_lbl == "BULLISH" else -1.5
+                    signals.append("Liquidity grab detected")
+
+            # Delta direction
+            if delta_pos and imb > 0.52:
+                of_score += 2.5
+                signals.append("Positive signed volume delta")
+            elif not delta_pos and imb < 0.48:
+                of_score -= 2.5
+                signals.append("Negative signed volume delta")
+
+            # Bias summary
+            if bias_lbl == "BULLISH":
+                signals.append("Order-flow bias: BULLISH")
+            elif bias_lbl == "BEARISH":
+                signals.append("Order-flow bias: BEARISH")
+
+            # Cap order-flow contribution
+            of_score = max(-12.0, min(12.0, of_score))
+            weights["order_flow"] = round(of_score, 1)
+            score += of_score
+        except Exception:
+            of_score = 0.0
+            weights["order_flow"] = 0.0
+
+        # --- 14. ML prognosis (history-trained probabilities) ---
+        if ml_forecast and ml_forecast.get("trained"):
+            pl = float(ml_forecast.get("p_long", 1.0 / 3.0))
+            ps = float(ml_forecast.get("p_short", 1.0 / 3.0))
+            ml_edge = (pl - ps) * 35.0
+            weights["ml_ensemble"] = round(ml_edge, 1)
+            score += ml_edge * 0.35
+            if pl > 0.42 and pl >= ps:
+                cv_a = ml_forecast.get("cv_accuracy_mean")
+                cv_s = f"{cv_a:.3f}" if cv_a is not None else "n/a"
+                signals.append(f"ML ensemble favors LONG (p={pl:.2f}; CV acc≈{cv_s})")
+            elif ps > 0.42 and ps > pl:
+                cv_a = ml_forecast.get("cv_accuracy_mean")
+                cv_s = f"{cv_a:.3f}" if cv_a is not None else "n/a"
+                signals.append(f"ML ensemble favors SHORT (p={ps:.2f}; CV acc≈{cv_s})")
+
         # --- FINAL SCORING ---
         score = float(np.clip(score, 0, 100))
-        
-        if score >= 70:
+
+        if score >= 50:
             direction = "LONG"
-        elif score <= 30:
+        elif score <= 35:
             direction = "SHORT"
         else:
             direction = "NEUTRAL"
+
+        if ml_forecast and ml_forecast.get("trained"):
+            pl = float(ml_forecast.get("p_long", 1.0 / 3.0))
+            ps = float(ml_forecast.get("p_short", 1.0 / 3.0))
+            if direction == "LONG" and pl < 0.26 and ps > pl + 0.08:
+                if score >= 58:  # 8-pt buffer keeps ≥50 after penalty
+                    score = max(0.0, score - 8.0)
+                    signals.append("ML conflict: probabilities lean SHORT vs rule-based LONG")
+            elif direction == "SHORT" and ps < 0.26 and pl > ps + 0.08:
+                score = max(0.0, score - 8.0)  # Safe: lowers score further into SHORT
+                signals.append("ML conflict: probabilities lean LONG vs rule-based SHORT")
+            score = float(np.clip(score, 0, 100))
+            if score >= 50:
+                direction = "LONG"
+            elif score <= 35:
+                direction = "SHORT"
+            else:
+                direction = "NEUTRAL"
 
         # Investment horizon confidence
         # Higher confluence = better for 3-12 month hold
@@ -2389,31 +2723,587 @@ class AIEnsemble:
 
 
 # ===============================================
-# 10. PROPOSAL ENGINE (ENHANCED)
+# 9b. ORDER FLOW (OHLCV / TAPE PROXY)
 # ===============================================
 
-@dataclass
-class InvestmentProposal:
-    symbol: str
-    direction: str
-    entry_price: float
-    stop_loss: float
-    tp_1: float
-    tp_2: float
-    tp_3: float  # NEW: Extended target for 3-12 month horizon
-    risk_reward: float
-    risk_reward_extended: float  # NEW: Extended R:R
-    ai_confidence: float
-    ai_grade: str
-    thesis: str
-    setup_type: str
-    position_size_pct: float
-    hold_period: str  # NEW: Estimated hold period
-    horizon_confidence: str  # NEW: Quality of setup for 3-12 month
-    sector_exposure: str  # NEW: Sector context
-    chart_data: Any
-    signals: List[str] = field(default_factory=list)
-    weights: Dict[str, float] = field(default_factory=dict)
+class OrderFlowEngine:
+    """
+    Bar-level order-flow proxies when tick data is unavailable:
+    buying pressure, signed volume delta, cumulative delta slope, absorption.
+    """
+
+    @staticmethod
+    def analyze(df: pd.DataFrame) -> Dict[str, Any]:
+        base = {
+            "of_imbalance": 0.5,
+            "of_buy_pressure_20": 0.5,
+            "of_delta_10": 0.0,
+            "of_cum_delta_slope": 0.0,
+            "of_absorption_flag": False,
+            "of_bias": "NEUTRAL",
+            "of_score_component": 0.0,
+            "of_vol_ratio": 1.0,
+            "of_delta_positive": False,
+            "of_summary": "Insufficient data",
+            # New detailed metrics
+            "of_imbalance_5": 0.5,
+            "of_imbalance_20": 0.5,
+            "of_delta_trend": "NEUTRAL",
+            "of_absorption_strength": 0.0,
+            "of_liquidity_grab": False,
+            "of_stop_run": False,
+            "of_institutional_footprint": "NEUTRAL",
+            "of_effort_ratio": 0.0,
+        }
+        df = normalize_ohlcv(df)
+        if df is None or df.empty or len(df) < 15:
+            return dict(base)
+        try:
+            c = df["close"].astype(float)
+            h = df["high"].astype(float)
+            low = df["low"].astype(float)
+            v = df["volume"].astype(float).clip(lower=0.0)
+            rng = (h - low).replace(0, np.nan)
+            bp = ((c - low) / rng).clip(0.0, 1.0).fillna(0.5)
+            signed = ((2.0 * bp - 1.0) * v).fillna(0.0)
+            d10 = float(signed.iloc[-10:].sum())
+            cum = signed.cumsum()
+            slope = float(cum.iloc[-1] - cum.iloc[-6]) if len(cum) > 6 else 0.0
+            slope_20 = float(cum.iloc[-1] - cum.iloc[-20]) if len(cum) > 20 else 0.0
+
+            # Determine delta trend
+            if slope > 0 and slope_20 > 0:
+                delta_trend = "BULLISH_ACCELERATING"
+            elif slope > 0 and slope_20 <= 0:
+                delta_trend = "BULLISH_DECELERATING"
+            elif slope < 0 and slope_20 < 0:
+                delta_trend = "BEARISH_ACCELERATING"
+            elif slope < 0 and slope_20 >= 0:
+                delta_trend = "BEARISH_DECELERATING"
+            else:
+                delta_trend = "NEUTRAL"
+
+            imb_ser = (bp * v).rolling(5, min_periods=3).sum() / (
+                v.rolling(5, min_periods=3).sum() + 1e-12
+            )
+            imb = float(np.clip(imb_ser.iloc[-1], 0.0, 1.0))
+
+            # Multi-timeframe imbalance
+            imb_ser_20 = (bp * v).rolling(20, min_periods=10).sum() / (
+                v.rolling(20, min_periods=10).sum() + 1e-12
+            )
+            imb_20 = float(np.clip(imb_ser_20.iloc[-1], 0.0, 1.0))
+
+            buy_p20 = float(bp.iloc[-20:].mean()) if len(bp) >= 20 else float(bp.mean())
+
+            tr = (h - low).rolling(14, min_periods=5).mean()
+            rng_ratio = float((h.iloc[-1] - low.iloc[-1]) / (float(tr.iloc[-1]) + 1e-12))
+            vma = float(v.rolling(20).mean().iloc[-1]) + 1e-12
+            vol_ratio = float(v.iloc[-1] / vma)
+
+            # Absorption strength (volume vs range)
+            absorption = rng_ratio < 0.65 and vol_ratio > 1.25
+            absorption_strength = (vol_ratio / (rng_ratio + 1e-12)) if absorption else 0.0
+
+            # Liquidity grab detection (wicks vs body)
+            upper_wick = h - c
+            lower_wick = c - low
+            body = abs(c - c.shift(1).fillna(c))
+            liquidity_grab = (upper_wick.iloc[-1] > 2 * body.iloc[-1]) or (lower_wick.iloc[-1] > 2 * body.iloc[-1])
+
+            # Stop run detection (wicks + volume spike)
+            stop_run = absorption and liquidity_grab and vol_ratio > 1.5
+
+            # Institutional footprint (large trader proxy)
+            # High volume + low range + price near high/low suggests institutional activity
+            inst_score = 0.0
+            if vol_ratio > 1.3 and rng_ratio < 0.5:
+                inst_score += 2.0
+            if abs(slope_20) > v.iloc[-20:].sum() * 0.1:
+                inst_score += 1.0
+            if inst_score >= 2.5:
+                inst_footprint = "HEAVY"
+            elif inst_score >= 1.5:
+                inst_footprint = "MODERATE"
+            else:
+                inst_footprint = "LIGHT"
+
+            # Effort ratio (volume relative to price movement)
+            price_change = abs(c.iloc[-1] - c.iloc[-5]) if len(c) >= 5 else 0
+            effort_ratio = (v.iloc[-5:].sum() / (price_change + 1e-12)) if price_change > 0 else 0.0
+
+            if imb > 0.56 and slope >= 0:
+                bias = "BULLISH"
+            elif imb < 0.44 and slope <= 0:
+                bias = "BEARISH"
+            else:
+                bias = "NEUTRAL"
+
+            comp = (imb - 0.5) * 22.0 + float(np.sign(slope)) * min(
+                abs(slope) / (v.iloc[-10:].sum() + 1e-12) * 800.0, 8.0
+            )
+            if absorption:
+                comp += 3.0 if c.iloc[-1] >= c.iloc[-2] else -3.0
+
+            summary = (
+                f"Imb {imb:.2f} | signed Δ10 {d10:.0f} | cumΔ slope {slope:.0f} | "
+                f"vol×{vol_ratio:.2f} | trend {delta_trend}"
+            )
+
+            out = dict(base)
+            out.update(
+                {
+                    "of_imbalance": imb,
+                    "of_imbalance_5": imb,
+                    "of_imbalance_20": imb_20,
+                    "of_buy_pressure_20": buy_p20,
+                    "of_delta_10": d10,
+                    "of_cum_delta_slope": slope,
+                    "of_cum_delta_slope_20": slope_20,
+                    "of_absorption_flag": bool(absorption),
+                    "of_absorption_strength": float(absorption_strength),
+                    "of_bias": bias,
+                    "of_score_component": float(comp),
+                    "of_vol_ratio": vol_ratio,
+                    "of_delta_positive": d10 > 0,
+                    "of_delta_trend": delta_trend,
+                    "of_liquidity_grab": bool(liquidity_grab),
+                    "of_stop_run": bool(stop_run),
+                    "of_institutional_footprint": inst_footprint,
+                    "of_effort_ratio": float(effort_ratio),
+                    "of_summary": summary,
+                }
+            )
+            return out
+        except Exception as e:
+            logger.debug("OrderFlowEngine failed: %s", e)
+            return dict(base)
+
+
+# ===============================================
+# 9c. ML PROGNOSIS (HISTORY-TRAINED ENSEMBLE)
+# ===============================================
+
+class MLPrognosisEngine:
+    """
+    Trains a small soft-voting ensemble on OHLCV-derived rows to estimate
+    P(LONG), P(SHORT), P(NEUTRAL) for a forward horizon, and reports CV / holdout metrics.
+    """
+
+    FORWARD_H = 10
+    RET_TH = 0.006
+    MIN_SAMPLES = 80  # reduced to ensure training on shorter histories
+    CACHE_SUBDIR = "ml_prognosis_cache"
+
+    @classmethod
+    def _cache_path(cls, symbol: str) -> str:
+        import os
+
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), cls.CACHE_SUBDIR)
+        os.makedirs(root, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", symbol.upper())
+        return os.path.join(root, f"{safe}_ensemble.joblib")
+
+    @classmethod
+    def _sklearn_bundle(cls):
+        try:
+            from sklearn.ensemble import (
+                GradientBoostingClassifier,
+                RandomForestClassifier,
+                VotingClassifier,
+            )
+            from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+            from sklearn.pipeline import Pipeline
+            from sklearn.preprocessing import StandardScaler
+
+            return (
+                True,
+                VotingClassifier,
+                RandomForestClassifier,
+                GradientBoostingClassifier,
+                TimeSeriesSplit,
+                cross_val_score,
+                Pipeline,
+                StandardScaler,
+            )
+        except Exception:
+            return (False,) + (None,) * 7
+
+    @classmethod
+    def _build_training_frame(cls, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        df = normalize_ohlcv(df)
+        if df is None or df.empty or len(df) < cls.MIN_SAMPLES + cls.FORWARD_H + 5:
+            return None
+        c = df["close"].astype(float)
+        h = df["high"].astype(float)
+        low = df["low"].astype(float)
+        v = df["volume"].astype(float).clip(lower=0.0)
+        rng = (h - low).replace(0, np.nan)
+        bp = ((c - low) / rng).clip(0.0, 1.0).fillna(0.5)
+        signed = ((2.0 * bp - 1.0) * v).fillna(0.0)
+        r1 = c.pct_change(1)
+        r5 = c.pct_change(5)
+        r20 = c.pct_change(20)
+        delta = c.diff()
+        gain = delta.clip(lower=0).fillna(0).ewm(alpha=1 / 14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).fillna(0).ewm(alpha=1 / 14, adjust=False).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi = (100 - (100 / (1 + rs))).fillna(100)
+        vz = (v - v.rolling(20).mean()) / (v.rolling(20).std() + 1e-9)
+        tr = pd.concat(
+            [
+                h - low,
+                (h - c.shift()).abs(),
+                (low - c.shift()).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr = tr.ewm(span=14, adjust=False).mean()
+        atr_pct = atr / (c + 1e-12) * 100.0
+        sma20 = c.rolling(20).mean()
+        sma50 = c.rolling(50).mean()
+        gap20 = c / (sma20 + 1e-12) - 1.0
+        gap50 = c / (sma50 + 1e-12) - 1.0
+        imb5 = (bp * v).rolling(5, min_periods=3).sum() / (v.rolling(5, min_periods=3).sum() + 1e-12)
+        cd20 = signed.rolling(20, min_periods=5).sum()
+        cdslope = cd20.diff(5)
+
+        # Order flow features (additional)
+        # Imbalance over 20 bars
+        imb20 = (bp * v).rolling(20, min_periods=10).sum() / (v.rolling(20, min_periods=10).sum() + 1e-12)
+        # Cumulative delta over 10 and 20 bars
+        cd10 = signed.rolling(10, min_periods=5).sum()
+        cdslope10 = cd10.diff(3) if len(cd10) > 3 else cd10 * 0
+        # Absorbtion proxy (volume vs range)
+        vol_ratio = v / (v.rolling(20).mean() + 1e-12)
+        rng_ratio = (h - low) / (atr + 1e-12)
+        absorption = ((rng_ratio < 0.65) & (vol_ratio > 1.25)).astype(float)
+        # Institutional footprint proxy
+        inst_footprint = ((vol_ratio > 1.3) & (rng_ratio < 0.5)).astype(float)
+
+        fwd = c.shift(-cls.FORWARD_H) / (c + 1e-12) - 1.0
+        y = np.where(
+            fwd > cls.RET_TH,
+            2,
+            np.where(fwd < -cls.RET_TH, 0, 1),
+        )
+        mat = pd.DataFrame(
+            {
+                "r1": r1,
+                "r5": r5,
+                "r20": r20,
+                "rsi": rsi,
+                "vz": vz,
+                "atr_pct": atr_pct,
+                "gap20": gap20,
+                "gap50": gap50,
+                "imb5": imb5,
+                "imb20": imb20,
+                "cdslope": cdslope,
+                "cdslope10": cdslope10,
+                "absorption": absorption,
+                "inst_footprint": inst_footprint,
+                "y": y,
+            }
+        )
+        mat = mat.iloc[: -cls.FORWARD_H].dropna()
+        if mat is None or len(mat) < cls.MIN_SAMPLES:
+            return None
+        return mat
+
+    @classmethod
+    def forecast(
+        cls,
+        symbol: str,
+        df: pd.DataFrame,
+        *,
+        force_retrain: bool = False,
+    ) -> Dict[str, Any]:
+        import os
+
+        import joblib
+
+        empty = {
+            "p_long": 1.0 / 3.0,
+            "p_short": 1.0 / 3.0,
+            "p_neutral": 1.0 / 3.0,
+            "direction_hint": "NEUTRAL",
+            "cv_accuracy_mean": None,
+            "holdout_accuracy": None,
+            "balanced_accuracy_holdout": None,
+            "macro_f1_holdout": None,
+            "win_rate_proxy": None,
+            "precision_long": None,
+            "precision_short": None,
+            "precision_neutral": None,
+            "recall_long": None,
+            "recall_short": None,
+            "recall_neutral": None,
+            "f1_long": None,
+            "f1_short": None,
+            "f1_neutral": None,
+            "brier_score": None,
+            "of_accuracy_proxy": None,
+            "of_win_rate_proxy": None,
+            "feature_importance": {},
+            "models": [],
+            "trained": False,
+            "n_samples": 0,
+            "error": None,
+        }
+        ok, VotingClassifier, RandomForestClassifier, GradientBoostingClassifier, TimeSeriesSplit, cross_val_score, Pipeline, StandardScaler = cls._sklearn_bundle()
+        if not ok:
+            empty["error"] = "scikit-learn not available"
+            return empty
+
+        mat = cls._build_training_frame(df)
+        if mat is None or mat.empty:
+            empty["error"] = "insufficient_history"
+            return empty
+
+        feature_cols = [c for c in mat.columns if c != "y"]
+        X = mat[feature_cols].to_numpy(dtype=float)
+        y = mat["y"].to_numpy(dtype=int)
+        n = len(mat)
+        last_ts = str(mat.index[-1]) if mat.index is not None else str(n)
+
+        path = cls._cache_path(symbol)
+        if not force_retrain and os.path.isfile(path):
+            try:
+                blob = joblib.load(path)
+                if (
+                    isinstance(blob, dict)
+                    and blob.get("last_ts") == last_ts
+                    and int(blob.get("n_samples", 0)) == n
+                    and blob.get("pipeline") is not None
+                ):
+                    return blob["report"]
+            except Exception:
+                pass
+
+        hold = max(int(n * 0.15), 30)
+        X_train, y_train = X[:-hold], y[:-hold]
+        X_test, y_test = X[-hold:], y[-hold:]
+
+        # Initialize additional metrics
+        of_accuracy_proxy = None
+        of_win_rate_proxy = None
+
+        clf = VotingClassifier(
+            estimators=[
+                (
+                    "rf",
+                    RandomForestClassifier(
+                        n_estimators=120,
+                        max_depth=14,
+                        min_samples_leaf=6,
+                        random_state=42,
+                        n_jobs=-1,
+                    ),
+                ),
+                (
+                    "gb",
+                    GradientBoostingClassifier(
+                        n_estimators=100,
+                        max_depth=4,
+                        learning_rate=0.06,
+                        random_state=42,
+                    ),
+                ),
+            ],
+            voting="soft",
+            n_jobs=-1,
+        )
+        pipe = Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                ("clf", clf),
+            ]
+        )
+
+        cv_mean = None
+        try:
+            tsc = TimeSeriesSplit(n_splits=min(5, max(2, n // 80)))
+            scores = cross_val_score(
+                pipe,
+                X_train,
+                y_train,
+                cv=tsc,
+                scoring="accuracy",
+                n_jobs=-1,
+            )
+            cv_mean = float(np.mean(scores))
+        except Exception as e:
+            logger.debug("ML CV failed %s: %s", symbol, e)
+
+        hold_acc = bal_acc = macro_f1 = win_proxy = None
+        precision_long = precision_short = precision_neutral = None
+        recall_long = recall_short = recall_neutral = None
+        f1_long = f1_short = f1_neutral = None
+        brier_score = None
+        try:
+            from sklearn.metrics import (
+                balanced_accuracy_score,
+                f1_score,
+                accuracy_score,
+                precision_score,
+                recall_score,
+                brier_score_loss,
+            )
+
+            pipe.fit(X_train, y_train)
+            pred = pipe.predict(X_test)
+            hold_acc = float(accuracy_score(y_test, pred))
+            bal_acc = float(balanced_accuracy_score(y_test, pred))
+            macro_f1 = float(
+                f1_score(y_test, pred, average="macro", zero_division=0)
+            )
+            win_proxy = float(np.mean(pred == y_test))
+
+            # Per-class metrics (labels: 0=SHORT, 1=NEUTRAL, 2=LONG)
+            # Use fixed label order to ensure indices align
+            labels = [0, 1, 2]
+            precisions = precision_score(y_test, pred, labels=labels, average=None, zero_division=0)
+            recalls = recall_score(y_test, pred, labels=labels, average=None, zero_division=0)
+            f1s = f1_score(y_test, pred, labels=labels, average=None, zero_division=0)
+            precision_short = float(precisions[0]) if len(precisions) > 0 else 0.0
+            precision_neutral = float(precisions[1]) if len(precisions) > 1 else 0.0
+            precision_long = float(precisions[2]) if len(precisions) > 2 else 0.0
+            recall_short = float(recalls[0]) if len(recalls) > 0 else 0.0
+            recall_neutral = float(recalls[1]) if len(recalls) > 1 else 0.0
+            recall_long = float(recalls[2]) if len(recalls) > 2 else 0.0
+            f1_short = float(f1s[0]) if len(f1s) > 0 else 0.0
+            f1_neutral = float(f1s[1]) if len(f1s) > 1 else 0.0
+            f1_long = float(f1s[2]) if len(f1s) > 2 else 0.0
+
+            # Brier score (calibration) - only for probabilistic predictions
+            try:
+                proba = pipe.predict_proba(X_test)
+                brier_score = float(brier_score_loss(y_test, proba))
+            except Exception:
+                brier_score = None
+
+            # Order flow accuracy proxy: How well do order flow signals predict forward returns?
+            # We evaluate on the test set only to avoid data leakage
+            try:
+                of_accuracy = None
+                of_win_rate = None
+                if len(mat) > hold:
+                    of_test = mat.iloc[-hold:].copy()
+                    # Bullish order flow: imbalance > 0.56, positive delta trend, or absorption in bullish direction
+                    bullish_of = (
+                        (of_test.get('imb20', 0.5) > 0.56) |
+                        (of_test.get('cdslope', 0) > 0) |
+                        ((of_test.get('absorption', 0) == 1) & (of_test.get('inst_footprint', 0) == 1))
+                    )
+                    bearish_of = (
+                        (of_test.get('imb20', 0.5) < 0.44) |
+                        (of_test.get('cdslope', 0) < 0) |
+                        ((of_test.get('absorption', 0) == 1) & (of_test.get('inst_footprint', 0) == 0))
+                    )
+                    y_test_series = pd.Series(y_test, index=of_test.index)
+                    # Win rate: when order flow was bullish, what % had positive returns?
+                    if bullish_of.sum() > 0:
+                        bull_returns = y_test_series[bullish_of]
+                        of_win_rate = float(np.mean(bull_returns == 2))  # Class 2 = LONG (positive return)
+                    # Accuracy: How often does order flow direction match the actual forward direction?
+                    # Simple: order flow bullish -> predict LONG, bearish -> predict SHORT
+                    of_preds = np.where(bullish_of, 2, np.where(bearish_of, 0, 1))
+                    of_accuracy = float(np.mean(of_preds == y_test))
+                of_accuracy_proxy = of_accuracy
+                of_win_rate_proxy = of_win_rate
+            except Exception:
+                of_accuracy_proxy = None
+                of_win_rate_proxy = None
+        except Exception as e:
+            logger.debug("ML holdout failed %s: %s", symbol, e)
+
+        try:
+            pipe.fit(X, y)
+        except Exception as e:
+            logger.debug("ML full-sample refit failed %s: %s", symbol, e)
+
+        try:
+            proba = pipe.predict_proba(X[-1:].reshape(1, -1))[0]
+            classes = list(pipe.named_steps["clf"].classes_)
+            pi = {int(classes[j]): float(proba[j]) for j in range(len(classes))}
+            p_long = float(pi.get(2, 0.0))
+            p_short = float(pi.get(0, 0.0))
+            p_neutral = float(pi.get(1, max(0.0, 1.0 - p_long - p_short)))
+
+            # Feature importance (average across ensemble)
+            clf = pipe.named_steps["clf"]
+            if hasattr(clf, 'estimators_'):
+                importances = []
+                for est in clf.estimators_:
+                    if hasattr(est, 'feature_importances_'):
+                        importances.append(est.feature_importances_)
+                if importances:
+                    avg_importance = np.mean(importances, axis=0)
+                    feature_names = [f"f{i}" for i in range(len(feature_cols))]
+                    # Map importance to feature names
+                    feature_importance = {str(feature_cols[i]): float(avg_importance[i]) for i in range(min(len(feature_cols), len(avg_importance)))}
+                else:
+                    feature_importance = {}
+            else:
+                feature_importance = {}
+        except Exception:
+            p_long = p_short = p_neutral = 1.0 / 3.0
+            feature_importance = {}
+
+        s = p_long + p_short + p_neutral + 1e-12
+        p_long, p_short, p_neutral = p_long / s, p_short / s, p_neutral / s
+        hint = (
+            "LONG"
+            if p_long >= p_short and p_long >= p_neutral
+            else "SHORT"
+            if p_short >= p_neutral
+            else "NEUTRAL"
+        )
+
+        report = {
+            "p_long": round(p_long, 4),
+            "p_short": round(p_short, 4),
+            "p_neutral": round(p_neutral, 4),
+            "direction_hint": hint,
+            "cv_accuracy_mean": None if cv_mean is None else round(cv_mean, 4),
+            "holdout_accuracy": None if hold_acc is None else round(hold_acc, 4),
+            "balanced_accuracy_holdout": None if bal_acc is None else round(bal_acc, 4),
+            "macro_f1_holdout": None if macro_f1 is None else round(macro_f1, 4),
+            "win_rate_proxy": None if win_proxy is None else round(win_proxy, 4),
+            "precision_long": None if precision_long is None else round(precision_long, 4),
+            "precision_short": None if precision_short is None else round(precision_short, 4),
+            "precision_neutral": None if precision_neutral is None else round(precision_neutral, 4),
+            "recall_long": None if recall_long is None else round(recall_long, 4),
+            "recall_short": None if recall_short is None else round(recall_short, 4),
+            "recall_neutral": None if recall_neutral is None else round(recall_neutral, 4),
+            "f1_long": None if f1_long is None else round(f1_long, 4),
+            "f1_short": None if f1_short is None else round(f1_short, 4),
+            "f1_neutral": None if f1_neutral is None else round(f1_neutral, 4),
+            "brier_score": None if brier_score is None else round(brier_score, 4),
+            "of_accuracy_proxy": None if of_accuracy_proxy is None else round(of_accuracy_proxy, 4),
+            "of_win_rate_proxy": None if of_win_rate_proxy is None else round(of_win_rate_proxy, 4),
+            "feature_importance": feature_importance,
+            "models": ["RandomForest", "GradientBoosting", "VotingSoft"],
+            "trained": True,
+            "n_samples": int(n),
+            "error": None,
+        }
+
+        try:
+            joblib.dump(
+                {
+                    "pipeline": pipe,
+                    "report": report,
+                    "last_ts": last_ts,
+                    "n_samples": n,
+                },
+                path,
+            )
+        except Exception as e:
+            logger.debug("ML cache write failed %s: %s", symbol, e)
+
+        return report
 
 
 from dataclasses import dataclass
@@ -2600,6 +3490,10 @@ class InvestmentProposal:
     chart_data: Any
     signals: List[str]
     weights: Dict[str, Any]
+    # Fundamental quality metrics
+    fundamental_quality: float = 50.0
+    piotroski_f: int = 0
+    altman_z: Optional[float] = None
 
 
 # =========================================================
@@ -2902,60 +3796,20 @@ class InvestmentProposal:
     money_flow_note: str
     short_term_score: float
 
+    order_flow: dict
+    ml_prognosis: dict
+
+    # Fundamental quality metrics
+    fundamental_quality: float = 50.0
+    piotroski_f: int = 0
+    altman_z: Optional[float] = None
+
 
 # =========================================================
 # NORMALIZATION
 # =========================================================
 
-def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = df.copy()
-
-    try:
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df.columns = [
-            str(c).lower().strip()
-            for c in df.columns
-        ]
-
-        rename_map = {
-            "adj close": "close"
-        }
-
-        df.rename(columns=rename_map, inplace=True)
-
-        required = [
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume"
-        ]
-
-        for col in required:
-            if col not in df.columns:
-                logger.warning(f"Missing OHLCV column: {col}")
-                return pd.DataFrame()
-
-        df = df[required]
-
-        df = df.replace([np.inf, -np.inf], np.nan)
-
-        df.dropna(inplace=True)
-
-        return df
-
-    except Exception as e:
-
-        logger.exception(f"normalize_ohlcv failed: {e}")
-
-        return pd.DataFrame()
 
 
 # =========================================================
@@ -3186,6 +4040,9 @@ class ProposalEngine:
         *,
         asset_class: str = "Stocks",
         flow_reference: Optional[Dict[str, Any]] = None,
+        use_order_flow: bool = True,
+        use_ml: bool = True,
+        force_ml_retrain: bool = False,
     ) -> Optional[InvestmentProposal]:
 
         try:
@@ -3261,18 +4118,32 @@ class ProposalEngine:
             # FEATURES
             # ---------------------------------------------
 
+            order_flow_ctx: Dict[str, Any] = {}
+            if use_order_flow:
+                order_flow_ctx = OrderFlowEngine.analyze(df)
+
+            ml_forecast: Dict[str, Any] = {}
+            if use_ml:
+                ml_forecast = MLPrognosisEngine.forecast(
+                    symbol,
+                    df,
+                    force_retrain=force_ml_retrain,
+                )
+
             features = ProposalEngine._build_features(
                 techs,
                 smc,
                 breakout,
                 funds,
                 sentiment,
-                analysts
+                analysts,
+                order_flow=order_flow_ctx,
             )
 
             ai = AIEnsemble.predict(
                 features,
-                market_regime
+                market_regime,
+                ml_forecast if use_ml else None,
             )
 
             if not ai:
@@ -3328,7 +4199,8 @@ class ProposalEngine:
                 confidence,
                 rr,
                 market_regime,
-                ai.get("horizon_confidence")
+                ai.get("horizon_confidence"),
+                direction=direction,
             )
 
             # ---------------------------------------------
@@ -3420,6 +4292,11 @@ class ProposalEngine:
                 sector_flow=sector_flow_ctx,
                 money_flow_note=money_note,
                 short_term_score=short_term,
+                order_flow=order_flow_ctx,
+                ml_prognosis=ml_forecast,
+                fundamental_quality=funds.get("buffett_score", 45.0),
+                piotroski_f=funds.get("piotroski_f", 0),
+                altman_z=funds.get("altman_z"),
             )
 
         except Exception as e:
@@ -3506,7 +4383,6 @@ class ProposalEngine:
             "pre_breakout": breakout.get("pre_breakout"),
         }
 
-    @staticmethod
     @staticmethod
     def _return_n_bars_pct(df: pd.DataFrame, bars: int = 22) -> Optional[float]:
         if df is None or df.empty or "close" not in df.columns:
@@ -3744,6 +4620,7 @@ class ProposalEngine:
         breakout = BreakoutEngine.analyze(df, smc, df_weekly) or {}
         sentiment = SentimentEngine.analyze(symbol) or {}
         analysts = AnalystConsensusEngine.get(symbol) or {}
+        funds = FundamentalEngine.get_fundamentals(symbol) or {}
         sector_flow = ProposalEngine._flow_context(
             symbol,
             sector_rotation,
@@ -3759,6 +4636,55 @@ class ProposalEngine:
             None,
             None,
         )
+        # Infer direction
+        direction = "NEUTRAL"
+        if breakout.get("breakout_type"):
+            direction = "LONG" if "BULLISH" in breakout["breakout_type"] else "SHORT"
+        elif st_score >= 50:
+            direction = "LONG"
+        elif st_score <= 35:
+            direction = "SHORT"
+
+        # --- Compute trade levels and position size ---
+        close = df["close"].iloc[-1]
+        # ATR (14-period)
+        high = df["high"]
+        low = df["low"]
+        prev_close = df["close"].shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean().iloc[-1]
+        if pd.isna(atr) or atr <= 0:
+            atr = close * 0.02
+        risk = atr * 1.5
+        if direction == "LONG":
+            sl = close - risk
+            tp1 = close + risk * 1.5
+            tp2 = close + risk * 3
+            tp3 = close + risk * 5
+        else:
+            sl = close + risk
+            tp1 = close - risk * 1.5
+            tp2 = close - risk * 3
+            tp3 = close - risk * 5
+        rr = ProposalEngine._calculate_rr(close, sl, tp2)
+        rr_ext = ProposalEngine._calculate_rr(close, sl, tp3)
+        pos_size = ProposalEngine._calculate_position_size(
+            st_score, rr, {}, "MEDIUM", direction=direction
+        )
+        ai_grade = ProposalEngine._calculate_grade(st_score, "MEDIUM")
+        setup_type = f"{direction}_SWING" if direction in ("LONG", "SHORT") else "WATCHLIST"
+        thesis = f"{direction} setup"
+        if breakout.get("breakout_type"):
+            thesis += f": {breakout['breakout_type']}"
+        if breakout.get("is_accumulating"):
+            thesis += " · Institutional accumulation"
+        if analysts.get("label"):
+            thesis += f" · Analyst {analysts['label']}"
+
         return {
             "symbol": symbol,
             "bucket": "Watchlist",
@@ -3772,6 +4698,33 @@ class ProposalEngine:
             "money_flow_note": money_note,
             "short_term_score": st_score,
             "analyst_consensus": analysts,
+            "fundamentals": funds,  # include full fundamentals
+            "ai_confidence": st_score,
+            "direction": direction,
+            # Fundamental quality
+            "fundamental_quality": funds.get("buffett_score", 45.0),
+            "piotroski_f": funds.get("piotroski_f", 0),
+            "altman_z": funds.get("altman_z"),
+            # Trade levels ... (as before)
+            # Trade levels
+            "entry_price": round(close, 2),
+            "stop_loss": round(sl, 2),
+            "tp_1": round(tp1, 2),
+            "tp_2": round(tp2, 2),
+            "tp_3": round(tp3, 2),
+            "risk_reward": rr,
+            "risk_reward_extended": rr_ext,
+            "position_size_pct": pos_size,
+            "ai_grade": ai_grade,
+            "thesis": thesis,
+            "setup_type": setup_type,
+            "hold_period": "1-3 Months",
+            "horizon_confidence": "MEDIUM",
+            "sector_exposure": "NEUTRAL",
+            "chart_data": None,
+            "signals": [],
+            "weights": {},
+            "ml_prognosis": None,
         }
 
     @staticmethod
@@ -3781,11 +4734,11 @@ class ProposalEngine:
         breakout,
         funds,
         sentiment,
-        analysts
+        analysts,
+        order_flow: Optional[Dict[str, Any]] = None,
     ):
 
-        return {
-
+        merged: Dict[str, Any] = {
             **techs,
             **smc,
             **breakout,
@@ -3805,6 +4758,10 @@ class ProposalEngine:
             "institutional_sentiment":
                 analysts.get("score", 50),
 
+            # Buffett/Munger quality score (0-90 scale → normalize to 0-50 weight)
+            "fundamental_quality":
+                funds.get("buffett_score", 45),  # default ~50% quality
+
             "weekly_aligned":
                 int(
                     breakout.get(
@@ -3821,6 +4778,11 @@ class ProposalEngine:
                     )
                 ),
         }
+        if order_flow:
+            for _k, _v in order_flow.items():
+                if isinstance(_k, str) and _k.startswith("of_"):
+                    merged[_k] = _v
+        return merged
 
     @staticmethod
     def _build_trade_levels(
@@ -3870,13 +4832,19 @@ class ProposalEngine:
 
     @staticmethod
     def _calculate_position_size(
-        confidence,
+        confidence,  # raw 0-100 score
         rr,
         market_regime,
-        horizon_confidence
+        horizon_confidence,
+        direction="LONG"  # add direction to invert SHORT scores
     ):
+        # Convert to effective confidence: SHORTs use inverted scale
+        if direction == "SHORT":
+            effective = 100 - confidence
+        else:
+            effective = confidence
 
-        edge = max(0, confidence - 50)
+        edge = max(0, effective - 50)
 
         size = edge * rr * 0.05
 
@@ -4203,6 +5171,7 @@ class AssetUniverse:
         "LARGE_CAP": 1.0,
         "GROWTH": 0.7,
         "SPECULATIVE": 0.4,
+        "MIDCAP": 0.6,
         "MICROCAP": 0.2,
         "CRYPTO": 0.5,
         "FOREX": 0.3
@@ -4212,32 +5181,83 @@ class AssetUniverse:
     # EQUITIES
     # ---------------------------------------
     STOCKS_LARGE_CAP = [
+        # Mega-cap tech
         "AAPL","MSFT","GOOGL","GOOG","AMZN","NVDA","META","TSLA","AVGO","ORCL",
         "ADBE","CRM","NFLX","INTU","QCOM","AMD","IBM","NOW","INTC","MU","LRCX",
-        "JPM","V","MA","BAC","WFC","GS","MS","BLK","AXP",
-        "UNH","JNJ","LLY","ABBV","TMO","AMGN","ISRG","VRTX",
-        "HD","MCD","NKE","SBUX","COST","WMT","PG","KO","PEP",
+        "CSCO","TXN","ADI","KLAC","AMAT","MCHP","SNPS","CDNS","ASML","PANW",
+        # Financials
+        "JPM","V","MA","BAC","WFC","GS","MS","BLK","AXP","C","PFG","MET",
+        "SCHW","BX","TROW","STT","NTRS","FITB","USB","PNC","KEY",
+        # Healthcare
+        "UNH","JNJ","LLY","ABBV","TMO","AMGN","ISRG","VRTX","ABT","DHR","PFE",
+        "MRK","BMY","GILD","REGN","VRTX","ILMN","MRNA","BIIB","CVS","CI",
+        # Consumer
+        "HD","MCD","NKE","SBUX","COST","WMT","PG","KO","PEP","TGT","WBA",
+        "CL","KMB","GIS","K","KHC","MDLZ","CPB","CAG","SJM",
+        # Industrials & Defense
         "XOM","CVX","COP","BA","CAT","HON","UPS","RTX","LMT","GE","DE",
-        "SPY"
+        "CAT","MMM","EMR","ETN","ITW","NOC","LHX","GD","HII","TXT",
+        # Telecom & Media
+        "T","VZ","CMCSA","DIS","NFLX","CHTR","FOXA","PARA","WBD",
+        # Utilities
+        "NEE","DUK","SO","D","AEP","EXC","SRE","ED","PEG","XEL",
+        # Real Estate
+        "PLD","AMT","EQIX","DLR","PSA","O","WY","SPG","VNO","SLG",
+        "SPY",  # ETF placeholder
+        # Expanded large-cap additions (increased stock universe)
+        "BRK.B","BKNG","LOW","TJX","ROST","ORLY","AZO","GM","DELL","HPQ","HPE","COF","AIG","PRU","ALL","TRV","ADP","FISV","FIS","GPN","DFS","HCA","MDT","BAX","ZTS","BDX","KDP","STZ","BF.B","LULU","CMG","DRI","YUM","QSR","EA","SWKS","QRVO","NUE","STLD","VMC","MLM","BLL","IP","PPG","KMI","EPD","MMP","BKR","SLB","HAL","FDX","CSX","UNP","NSC","IR","GWW","WM","RSG","HWM","PH","IT","ANET","FTNT","ENPH","PAYC","AXON"
     ]
 
     STOCKS_GROWTH = [
         "COIN","SOFI","RBLX","RIVN","BABA","MSTR","OPEN","SMR","IONQ",
-        "TTD","ON","RDDT","SMCI"
+        "TTD","ON","RDDT","SMCI","PDD","JD","BILI","NIO","XPENG","LI",
+        "PTON","UBER","LYFT","DASH","SNOW","PLTR","CRWD","ZS","NET","OKTA",
+        "TEAM","MDB","DDOG","AYX","TWLO","MELI","SHOP","SE","BIDU","BKKT",
+        "ASAN","UPST","AFRM","SQ","PYPL","COUP","VEEV","DOCU","ZM","TWOU",
+        "U","MNDY","DUOL","ESTC","GTLB","HCP","RAMP","M","MSTR","HOOD",
+        "SOUN","RKLB","ACLS","BEAM","DNA","EXAS","IONS","CRSP","EDIT","NTLA",
+        "VCEL","ALGN","INMD","ISRG","IRTC","NVCR","TMDX","UTRS","INSP","LMND",
+        "UPWK","PINS","SWK","W","BYND","TTCF","IMGN","NVTA","CRNX","VRTX"
     ]
 
     STOCKS_SPECULATIVE = [
-        "OKLO","AI","QBTS","RUM","ACHR","PONY","NNE","CHPT"
+        "OKLO","AI","QBTS","RUM","ACHR","PONY","NNE","CHPT","RGT","ARVL",
+        "LAZR","MAXR","BLNK","BLNKW","SPCE","VORB","RDW","ALGM","ALGT",
+        "ATSG","GXO","FLYG","HA","JBLU","UAL","AAL","DAL","LUV","RYAAY",
+        "SAVE","ALK","SKYW","VRM","CAR","ABUS","AIM","AREN","BCOV","BMRN"
+    ]
+
+    STOCKS_MIDCAP = [
+        # S&P 400 mid-caps
+        "ETSY","TTWO","VRSK","CSGP","CPRT","CDW","FANG","DLTR","CEG","ROL",
+        "MSCI","SPGI","NEM","CF","MOS","APD","SHW","LIN","CTAS","EXPD",
+        "ADSK","PAYX","ANSS","ONS","MORN","ZBRA","DXCM","BRO","FAST","NDSN",
+        "HTLF","BANC","CIVI","O","VTR","WELL","ELS","REG","FRT","KIM",
+        "CAG","K","SJM","TAP","CCL","RCL","EXPE","MAR","HLT","H",
+        "CNP","ATO","AEE","XEL","ES","DTE","PPL","FE","ETR","WEC",
+        "VST","NRG","SRE","DTE","PEG","ED","EIX","AEP","D","DUK",
+        "NEE","SO","EXC","PWR","AES","NRG","VST","OGE","OKE","WMB",
+        "HES","COTY","PVH","RL","GPS","LEVI","FL","DECK","ZUMZ","BKE",
+        "CHD","COTY","EL","OLPX","NWL","CLX","HRL","SJM","CAG","K",
+        "MKC","KMB","PG","CL","KO","PEP","WMT","TGT","COST","DG","DLTR",
+        "KR","WBA","BG","KHC","GIS","CPB","CAG","SJM","MKC","KMB",
+        "BIG","OLLI","CURLF","SNDX","CXDO","CERT","TMDX","INSP","AMN","ACAD"
     ]
 
     STOCKS_MICROCAP = [
-        "PSTV","RNAZ","EH","AAOI","HOTH","DVLT","TOVX","BSOL","BBAR","CDE","NGD"
+        "PSTV","RNAZ","EH","AAOI","HOTH","DVLT","TOVX","BSOL","BBAR","CDE","NGD",
+        "AUY","GDX","GDXJ","NEM","KGC","ABX","GG","GFI","OR","AU","AEM",
+        "Bathon","BTG","KGC","NG","F","VGZ","EXK","SSRM","SAND","PLL","HL",
+        "CLF","Vale","RNO","SBSW","SBGL","GGB","CX","TGB","SCCO","FCX",
+        "ATNM","UEC","URG","DNN","UUU","ISR","UC","NXE","LEU","URRE","NFEC",
+        "MNTS","ZEPP","MVIS","VYGR","AVO","MEIP","RVP","PVC","TKAT","RSLS"
     ]
 
     STOCKS_ALL = list(set(
         STOCKS_LARGE_CAP +
         STOCKS_GROWTH +
         STOCKS_SPECULATIVE +
+        STOCKS_MIDCAP +
         STOCKS_MICROCAP
     ))
 
@@ -4274,6 +5294,9 @@ class AssetUniverse:
         if symbol in AssetUniverse.STOCKS_SPECULATIVE:
             return AssetUniverse.UNIVERSE_WEIGHTS["SPECULATIVE"]
 
+        if symbol in AssetUniverse.STOCKS_MIDCAP:
+            return AssetUniverse.UNIVERSE_WEIGHTS["MIDCAP"]
+
         if symbol in AssetUniverse.STOCKS_MICROCAP:
             return AssetUniverse.UNIVERSE_WEIGHTS["MICROCAP"]
 
@@ -4291,9 +5314,14 @@ class AssetUniverse:
 # ===============================================
 def safe_num(x, default=0.0):
     try:
-        return float(x) if x is not None else default
+        if x is None:
+            return default
+        return float(x)
     except Exception:
         return default
+
+# Alias for backward compatibility
+safe = safe_num
 
 
 def safe_asset_block(asset: dict) -> dict:
@@ -4589,7 +5617,7 @@ def main_ui():
     st.set_page_config(layout="wide", page_title="Institutional Breakout Terminal v4")
 
     st.title("🚀 Institutional Breakout & Investment Terminal")
-    st.caption("3–12 Month Investment Opportunity Scanner | Multi-Timeframe | Market Regime Aware, Tnx to Kicko Ognenovski, Nikola Stojcevski, Altaj Sulejman, Dejan Butevski, Anastas Dzurovski")
+    st.caption("3–12 Month Investment Opportunity Scanner, with AI, Technical Indicators, SMC & Market Regime, Berkshire Hathaway criteria, Tnx to knowledges from: Dr. Anastas Dzurovski, Kicko Ognenovski, Nikola Stojcevski, Altaj Sulejman, Dejan Butevski")
 
     # =========================================================
     # SIDEBAR CONFIG (UPGRADED)
@@ -4602,7 +5630,7 @@ def main_ui():
     scan_mode = st.sidebar.radio(
         "Scan Mode",
         ["Quick Scan (Watchlist)", "Full Market Scan (All Assets)"],
-        index=0
+        index=1
     )
 
     asset_class = st.sidebar.selectbox(
@@ -4625,9 +5653,9 @@ def main_ui():
     else:
         try:
             default_symbols = ", ".join(
-                STOCKS_ALL if asset_class == "Stocks"
-                else CRYPTO_ALL if asset_class == "Crypto"
-                else FOREX_ALL
+                AssetUniverse.STOCKS_ALL if asset_class == "Stocks"
+                else AssetUniverse.CRYPTO_ALL if asset_class == "Crypto"
+                else AssetUniverse.FOREX_ALL
             )
         except NameError:
             # fallback safety if global lists are missing
@@ -4665,7 +5693,7 @@ def main_ui():
         "Min AI Confidence (%)",
         min_value=40,
         max_value=90,
-        value=55,
+        value=40,  # lowered to capture more borderline setups
         step=1,
         help="Filters out weak setups below this confidence threshold"
     )
@@ -4677,6 +5705,21 @@ def main_ui():
     st.sidebar.caption(f"📊 Symbols loaded: {len(symbols)}")
     st.sidebar.caption(f"Mode: {scan_mode.split(' ')[0]}")
     st.sidebar.caption(f"Asset class: {asset_class}")
+
+    use_order_flow = st.sidebar.checkbox(
+        "Order-flow tape proxy (OHLCV)",
+        value=True,
+        help="Uses bar microstructure proxies (signed volume delta, imbalance, absorption) for extra confluence.",
+    )
+    use_ml = st.sidebar.checkbox(
+        "ML prognosis (train on history)",
+        value=True,
+        help="Fits a small ensemble on past bars, reports CV / holdout metrics, and blends probabilities into the AI score.",
+    )
+    force_ml_retrain = st.sidebar.checkbox(
+        "Force ML retrain (ignore disk cache)",
+        value=False,
+    )
     # =========================================================
     # HELPERS
     # =========================================================
@@ -4778,12 +5821,18 @@ def main_ui():
                     df_weekly=df_weekly,
                     asset_class=asset_class,
                     flow_reference=flow_reference,
+                    use_order_flow=use_order_flow,
+                    use_ml=use_ml,
+                    force_ml_retrain=force_ml_retrain,
                 )
                 if prop:
                     sf = prop.sector_flow or {}
                     ba = prop.breakout_analytics or {}
                     sn = prop.sentiment_snapshot or {}
                     ac = prop.analyst_consensus or {}
+                    ofx = {}
+                    if use_order_flow:
+                        ofx = OrderFlowEngine.analyze(df) or {}
                     flow_rows.append({
                         "Symbol": prop.symbol,
                         "Bucket": "Trade setup",
@@ -4805,7 +5854,15 @@ def main_ui():
                         "Money flow": prop.money_flow_note,
                         "Analyst": ac.get("score"),
                         "Analyst label": ac.get("label"),
+                        "Buffett": safe(getattr(prop, "fundamental_quality", 0)),
+                        "Piotroski F": getattr(prop, "piotroski_f", "—"),
+                        "Altman Z": round(getattr(prop, "altman_z", np.nan), 2) if getattr(prop, "altman_z", None) is not None else np.nan,
+                        "OF bias": ofx.get("of_bias", "—"),
+                        "OF trend": ofx.get("of_delta_trend", "—"),
+                        "Imbalance": round(ofx.get("of_imbalance", 0.5), 3),
+                        "Inst footp.": ofx.get("of_institutional_footprint", "—"),
                     })
+                    return prop  # <-- CRITICAL: return successful proposal
                 else:
                     qs = ProposalEngine.quick_surface(
                         sym,
@@ -4820,6 +5877,11 @@ def main_ui():
                         ba = qs.get("breakout_analytics") or {}
                         sn = qs.get("sentiment_snapshot") or {}
                         ac = qs.get("analyst_consensus") or {}
+                        # Quick surface doesn't compute full order flow, but we can fetch it optionally
+                        ofx = {}
+                        if use_order_flow:
+                            ofx = OrderFlowEngine.analyze(df) or {}
+                        money_note = qs.get("money_flow_note", "—")
                         flow_rows.append({
                             "Symbol": qs["symbol"],
                             "Bucket": "Watchlist",
@@ -4838,22 +5900,50 @@ def main_ui():
                             "Sector flow": sf.get("bias"),
                             "Sector ETF": sf.get("etf"),
                             "Sector 1m %": sf.get("return_1m_pct"),
-                            "Money flow": qs.get("money_flow_note"),
+                            "Money flow": money_note,
                             "Analyst": ac.get("score"),
                             "Analyst label": ac.get("label"),
+                "Buffett": safe(qs.get("fundamental_quality", 0)),
+                "Piotroski F": qs.get("piotroski_f", "—"),
+                "Altman Z": round(qs.get("altman_z", np.nan), 2) if qs.get("altman_z") is not None else np.nan,
+                "OF bias": ofx.get("of_bias", "—"),
+                            "OF trend": ofx.get("of_delta_trend", "—"),
+                            "Imbalance": round(ofx.get("of_imbalance", 0.5), 3),
+                            "Inst footp.": ofx.get("of_institutional_footprint", "—"),
                         })
-                return prop
+                        # Convert quick_surface dict to proposal object
+                        proposal_obj = SimpleNamespace()
+                        for _k, _v in qs.items():
+                            setattr(proposal_obj, _k, _v)
+                        proposal_obj.order_flow = ofx  # attach computed order flow
+                        return proposal_obj
+                return None
             except Exception:
                 return None
 
-        with ThreadPoolExecutor(max_workers=8) as ex:
+        with ThreadPoolExecutor(max_workers=16) as ex:
             futures = {ex.submit(fetch, s): s for s in symbols}
 
             for i, f in enumerate(as_completed(futures)):
                 progress.progress((i + 1) / len(symbols))
                 res = f.result()
-                if res and res.ai_confidence >= min_confidence:
-                    proposals.append(res)
+                if res:
+                    # Extract direction and confidence (handles both object and dict)
+                    direction = getattr(res, "direction", None)
+                    if direction is None and isinstance(res, dict):
+                        direction = res.get("direction")
+                    conf = getattr(res, "ai_confidence", None)
+                    if conf is None and isinstance(res, dict):
+                        conf = res.get("ai_confidence")
+                    if conf is not None:
+                        if direction == "LONG":
+                            effective = conf
+                        elif direction == "SHORT":
+                            effective = 100 - conf
+                        else:
+                            effective = 0
+                        if effective >= min_confidence:
+                            proposals.append(res)
 
         progress.empty()
 
@@ -4865,6 +5955,23 @@ def main_ui():
             return
 
         proposals.sort(key=lambda x: x.ai_confidence, reverse=True)
+
+        # Ensure all proposals have valid position sizing (safety net for quick_surface or legacy)
+        for _p in proposals:
+            current = getattr(_p, "position_size_pct", None)
+            if current is None or float(current) <= 0:
+                direction = getattr(_p, "direction", "LONG")
+                conf = getattr(_p, "ai_confidence", 50)
+                rr = getattr(_p, "risk_reward", 3.0)
+                if not isinstance(rr, (int, float)) or rr <= 0:
+                    rr = 3.0
+                new_pos = ProposalEngine._calculate_position_size(
+                    conf, rr, {}, "MEDIUM", direction=direction
+                )
+                try:
+                    setattr(_p, "position_size_pct", new_pos)
+                except Exception:
+                    pass
 
         # =========================================================
         # SUMMARY
@@ -4904,6 +6011,102 @@ def main_ui():
             f"Market positioning bias: {bias} | "
             f"Net skew: {longs - shorts:+d} setups"
         )
+
+        ml_cv_vals = []
+        ml_hold_vals = []
+        ml_prec_l_vals = []
+        ml_rec_l_vals = []
+        ml_f1_l_vals = []
+        ml_brier_vals = []
+        of_acc_vals = []
+        of_wr_vals = []
+        for _p in proposals:
+            _m = getattr(_p, "ml_prognosis", None) or {}
+            if _m.get("cv_accuracy_mean") is not None:
+                ml_cv_vals.append(float(_m["cv_accuracy_mean"]))
+            if _m.get("holdout_accuracy") is not None:
+                ml_hold_vals.append(float(_m["holdout_accuracy"]))
+            if _m.get("precision_long") is not None:
+                ml_prec_l_vals.append(float(_m["precision_long"]))
+            if _m.get("recall_long") is not None:
+                ml_rec_l_vals.append(float(_m["recall_long"]))
+            if _m.get("f1_long") is not None:
+                ml_f1_l_vals.append(float(_m["f1_long"]))
+            if _m.get("brier_score") is not None:
+                ml_brier_vals.append(float(_m["brier_score"]))
+            if _m.get("of_accuracy_proxy") is not None:
+                of_acc_vals.append(float(_m["of_accuracy_proxy"]))
+            if _m.get("of_win_rate_proxy") is not None:
+                of_wr_vals.append(float(_m["of_win_rate_proxy"]))
+
+        with st.expander("AI / ML prognosis quality (this scan)", expanded=False):
+            if ml_cv_vals:
+                st.write(
+                    f"Mean time-series CV accuracy: **{float(np.mean(ml_cv_vals)):.1%}** "
+                    f"(min {float(np.min(ml_cv_vals)):.1%}, max {float(np.max(ml_cv_vals)):.1%})"
+                )
+            else:
+                st.caption("ML metrics unavailable (disabled or insufficient history).")
+            if ml_hold_vals:
+                st.write(
+                    f"Mean holdout accuracy (tail slice): **{float(np.mean(ml_hold_vals)):.1%}**"
+                )
+            if ml_prec_l_vals:
+                st.write(
+                    f"Mean precision (LONG class): **{float(np.mean(ml_prec_l_vals)):.3f}** · "
+                    f"recall (LONG): **{float(np.mean(ml_rec_l_vals)):.3f}** · "
+                    f"F1 (LONG): **{float(np.mean(ml_f1_l_vals)):.3f}**"
+                )
+            if ml_brier_vals:
+                st.write(
+                    f"Mean Brier score (calibration, lower is better): **{float(np.mean(ml_brier_vals)):.4f}**"
+                )
+            if of_acc_vals:
+                st.write(
+                    f"Order-flow directional accuracy (historical proxy): **{float(np.mean(of_acc_vals)):.1%}**"
+                )
+            if of_wr_vals:
+                st.write(
+                    f"Order-flow long win-rate (bullish signals → profit): **{float(np.mean(of_wr_vals)):.1%}**"
+                )
+            st.caption(
+                "Models: RandomForest + GradientBoosting (soft vote), trained on OHLCV + order-flow rows. "
+                "Labels use forward-return buckets (LONG/SHORT/NEUTRAL within 10 bars); CV uses TimeSeriesSplit. "
+                "Displayed metrics: precision/recall/F1 per class, Brier score (calibration), feature importance, order flow accuracy proxy. "
+                "For research context only — past performance does not guarantee future results."
+            )
+            st.caption(
+                "Models: RandomForest + GradientBoosting (soft vote), trained on OHLCV + order-flow rows. "
+                "Labels use forward-return buckets (LONG/SHORT/NEUTRAL within 10 bars); CV uses TimeSeriesSplit. "
+                "Displayed metrics: precision/recall/F1 per class, Brier score (calibration), feature importance. "
+                "For research context only — past performance does not guarantee future results."
+            )
+
+        # =========================================================
+        # FEATURE IMPORTANCE SUMMARY (AGGREGATE)
+        # =========================================================
+        all_feat_importances = {}
+        for _p in proposals:
+            _m = getattr(_p, "ml_prognosis", None) or {}
+            _fi = _m.get("feature_importance", {})
+            if isinstance(_fi, dict) and _fi:
+                for feat, imp in _fi.items():
+                    if feat not in all_feat_importances:
+                        all_feat_importances[feat] = []
+                    all_feat_importances[feat].append(float(imp))
+
+        if all_feat_importances:
+            # Average importances across models
+            avg_importances = {k: np.mean(v) for k, v in all_feat_importances.items()}
+            sorted_feats = sorted(avg_importances.items(), key=lambda x: x[1], reverse=True)[:10]
+            with st.expander("🔬 Top 10 Predictive Features (Aggregate)", expanded=False):
+                if sorted_feats:
+                    st.caption("Features ranked by average importance across all ML models in this scan:")
+                    for feat, imp in sorted_feats:
+                        st.write(f"- **{feat}**: {imp:.4f}")
+                else:
+                    st.caption("No feature importance data available.")
+
         # =========================================================
         # SHORTER-TERM EDGE (SETUPS)
         # =========================================================
@@ -4925,7 +6128,8 @@ def main_ui():
             sn = getattr(p, "sentiment_snapshot", None) or {}
             sf = getattr(p, "sector_flow", None) or {}
             ac = getattr(p, "analyst_consensus", None) or {}
-
+            mlx = getattr(p, "ml_prognosis", None) or {}
+            ofx = getattr(p, "order_flow", None) or {}
             edge_rows.append({
                 "Symbol": getattr(p, "symbol", ""),
                 "Flow": sf.get("flow_type", "EQUITY"),
@@ -4945,6 +6149,17 @@ def main_ui():
 
                 "Money flow": getattr(p, "money_flow_note", "—"),
                 "Analyst": ac.get("score", 0),
+
+                "Buffett": safe(getattr(p, "fundamental_quality", 0)),
+                "Piotroski F": safe(getattr(p, "piotroski_f", 0)),
+                "Altman Z": round(getattr(p, "altman_z", np.nan), 2) if getattr(p, "altman_z", None) is not None else np.nan,
+
+                "ML CV": (
+                    f"{float(mlx['cv_accuracy_mean']):.1%}"
+                    if mlx.get("cv_accuracy_mean") is not None
+                    else "—"
+                ),
+                "OF bias": ofx.get("of_bias", "—"),
             })
 
         edge_df = pd.DataFrame(edge_rows)
@@ -4963,8 +6178,8 @@ def main_ui():
                 ascending=[False, False, False],
             ).drop(columns=["_edge", "_brk", "_rr"], errors="ignore")
 
-            # Optional: highlight top 5 setups mentally (no UI dependency)
-            top_n = min(5, len(edge_df))
+            # Optional: highlight top 10 setups mentally (no UI dependency)
+            top_n = min(10, len(edge_df))
             st.caption(f"🔥 Top {top_n} setups show strongest composite edge")
 
         # -------------------------
@@ -5042,12 +6257,14 @@ def main_ui():
         # -------------------------
         table = []
 
-        for p in proposals[:20]:
+        for p in proposals[:50]:
 
             ba = getattr(p, "breakout_analytics", None) or {}
             sn = getattr(p, "sentiment_snapshot", None) or {}
             sf = getattr(p, "sector_flow", None) or {}
             ac = getattr(p, "analyst_consensus", None) or {}
+            ofx = getattr(p, "order_flow", None) or {}
+            mlx = getattr(p, "ml_prognosis", None) or {}
 
             table.append({
                 "Symbol": getattr(p, "symbol", "—"),
@@ -5056,6 +6273,32 @@ def main_ui():
 
                 "Confidence": safe(getattr(p, "ai_confidence", 0)),
                 "Short-term": round(safe(getattr(p, "short_term_score", 0)), 1),
+
+                "OF bias": ofx.get("of_bias", "—"),
+                "OF trend": ofx.get("of_delta_trend", "—"),
+                "Inst footprint": ofx.get("of_institutional_footprint", "—"),
+
+                "ML p(L)": round(safe(mlx.get("p_long", 0)), 3),
+                "ML CV acc": (
+                    f"{float(mlx['cv_accuracy_mean']):.1%}"
+                    if mlx.get("cv_accuracy_mean") is not None
+                    else "—"
+                ),
+                "ML Prec(L)": (
+                    f"{float(mlx.get('precision_long', 0)):.3f}"
+                    if mlx.get("precision_long") is not None
+                    else "—"
+                ),
+                "ML Rec(L)": (
+                    f"{float(mlx.get('recall_long', 0)):.3f}"
+                    if mlx.get("recall_long") is not None
+                    else "—"
+                ),
+                "ML Brier": (
+                    f"{float(mlx.get('brier_score', 0)):.3f}"
+                    if mlx.get("brier_score") is not None
+                    else "—"
+                ),
 
                 "Flow": sf.get("flow_type", "—"),
                 "Context": sf.get("sector_name", "—"),
@@ -5071,6 +6314,10 @@ def main_ui():
 
                 "Analyst": safe(ac.get("score", 0)),
                 "A. label": ac.get("label", "—"),
+
+                "Buffett": safe(getattr(p, "fundamental_quality", 0)),
+                "Piotroski F": safe(getattr(p, "piotroski_f", 0)),
+                "Altman Z": round(getattr(p, "altman_z", np.nan), 2) if getattr(p, "altman_z", None) is not None else np.nan,
 
                 "Entry": safe(getattr(p, "entry_price", 0)),
                 "SL": safe(getattr(p, "stop_loss", 0)),
@@ -5150,11 +6397,62 @@ def main_ui():
                 c2.metric("TP3", safe(getattr(p, "tp_3", 0)))
                 c3.metric("R:R", f"1:{safe(getattr(p, 'risk_reward', 0))}")
 
-                # -------------------------
-                # THESIS
-                # -------------------------
-                st.write("📌 Thesis:")
-                st.write(safe_str(getattr(p, "thesis", "—")))
+                ofx = getattr(p, "order_flow", None) or {}
+                mlx = getattr(p, "ml_prognosis", None) or {}
+                o1, o2, o3 = st.columns(3)
+                o1.metric("Order-flow bias", str(ofx.get("of_bias", "—")))
+                o2.metric("ML P(LONG)", f"{safe(mlx.get('p_long', 0)):.3f}")
+                _cv = mlx.get("cv_accuracy_mean")
+                o3.metric(
+                    "ML CV overall acc",
+                    f"{float(_cv):.1%}" if _cv is not None else "n/a",
+                )
+
+                # Additional ML metrics row
+                _prec_l = mlx.get("precision_long")
+                _rec_l = mlx.get("recall_long")
+                _f1_l = mlx.get("f1_long")
+                _prec_s = mlx.get("precision_short")
+                _rec_s = mlx.get("recall_short")
+                _f1_s = mlx.get("f1_short")
+                _brier = mlx.get("brier_score")
+
+                if any(v is not None for v in [_prec_l, _rec_l, _f1_l, _prec_s, _rec_s, _f1_s, _brier]):
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    if _prec_l is not None:
+                        m1.metric("Prec(L)", f"{_prec_l:.3f}")
+                    if _rec_l is not None:
+                        m2.metric("Recall(L)", f"{_rec_l:.3f}")
+                    if _f1_l is not None:
+                        m3.metric("F1(L)", f"{_f1_l:.3f}")
+                    if _brier is not None:
+                        m4.metric("Brier", f"{_brier:.3f}")
+                    if _prec_s is not None:
+                        m5.metric("Prec(S)", f"{_prec_s:.3f}")
+
+                # Holdout accuracy and feature importance snippet
+                _ho = mlx.get("holdout_accuracy")
+                _f1m = mlx.get("macro_f1_holdout")
+                _of_acc = mlx.get("of_accuracy_proxy")
+                _of_wr = mlx.get("of_win_rate_proxy")
+                if _ho is not None or _f1m is not None or _of_acc is not None or _of_wr is not None:
+                    parts = []
+                    if _ho is not None:
+                        parts.append(f"ML holdout {float(_ho):.1%}")
+                    if _f1m is not None:
+                        parts.append(f"macro-F1 {float(_f1m):.3f}")
+                    if _of_acc is not None:
+                        parts.append(f"OF acc {float(_of_acc):.1%}")
+                    if _of_wr is not None:
+                        parts.append(f"OF win-rate {float(_of_wr):.1%}")
+                    st.caption(" · ".join(parts))
+
+                # Feature importance (top 5)
+                feat_imp = mlx.get("feature_importance", {})
+                if feat_imp and isinstance(feat_imp, dict):
+                    sorted_feats = sorted(feat_imp.items(), key=lambda x: x[1], reverse=True)[:5]
+                    if sorted_feats:
+                        st.caption("Top 5 ML features: " + ", ".join([f"{k} ({v:.3f})" for k,v in sorted_feats]))
 
                 # -------------------------
                 # SAFE META EXTRACTION
