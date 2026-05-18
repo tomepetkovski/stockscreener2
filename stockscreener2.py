@@ -29,8 +29,13 @@ import time
 import json
 from typing import Dict, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 import numpy as np
 import math
+import requests
+import schedule
+import threading
+import time
 from typing import Dict, Any, Optional, List
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,45 @@ import yfinance as yf
 
 
 import time
+
+
+# =====================================================
+# YAHOO FINANCE STDERR-SILENCE HELPERS
+# =====================================================
+import io as _io
+import sys as _sys
+
+_YAHOO_SPAM = (
+    "HTTP Error 401",
+    "Invalid Crumb",
+    "Too Many Requests",
+    "YFRateLimitError",
+    "CRUMB",
+)
+
+_orig_stderr = _sys.stderr
+
+class _YFSilentBuffer(_io.StringIO):
+    def write(self, s: str) -> int:
+        if any(pat in s for pat in _YAHOO_SPAM):
+            return 0
+        _orig_stderr.write(s)
+        return 0
+
+    def flush(self) -> None:
+        pass
+
+_yf_buf = _YFSilentBuffer()
+
+def _yf_call(fn, *args, **kwargs):
+    """Run fn(*args, **kwargs) with sys.stderr pointed at Yahoo-spam filter."""
+    old = _sys.stderr
+    _sys.stderr = _yf_buf
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _sys.stderr = old
+
 
 def safe_yf_download(*args, retries=3, **kwargs):
 
@@ -83,6 +127,448 @@ def safe_yf_download(*args, retries=3, **kwargs):
             time.sleep(1.5)
 
     return pd.DataFrame()
+
+
+# ===============================================
+# AUTO-SCAN + TELEGRAM NOTIFICATION INFRASTRUCTURE
+# ===============================================
+
+# --- Timing ---
+_AUTO_SCAN_INTERVAL_HOURS: float = 4.0
+_AUTO_SCAN_INTERVAL_SECS: int  = int(_AUTO_SCAN_INTERVAL_HOURS * 3600)
+
+# --- Telegram configuration (override via env-var) ---
+_TG_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "") or "7608970630:AAH5YDKlFdRrxp5pLAwNvoCq4yqIQTTm0yE"
+_TG_CHAT_ID:   str = os.environ.get("TELEGRAM_CHAT_ID",   "") or "-1002385326575"
+_TG_API_URL:   str = f"https://api.telegram.org/bot{_TG_BOT_TOKEN}"
+
+
+# ---------------------------------------------------------------------------
+# HTML escape helper (used by Telegram notifier)
+# ---------------------------------------------------------------------------
+
+def _esc_html(text: str) -> str:
+    return text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+
+# ---------------------------------------------------------------------------
+# TelegramNotifier
+# ---------------------------------------------------------------------------
+
+class TelegramNotifier:
+    """Thin wrapper around the Telegram Bot HTTP API (HTML parse-mode)."""
+
+    def __init__(self, token: str = _TG_BOT_TOKEN, chat_id: str = _TG_CHAT_ID):
+        self.token   = token or _TG_BOT_TOKEN
+        self.chat_id = chat_id or _TG_CHAT_ID
+        self._base   = f"https://api.telegram.org/bot{self.token}"
+
+    def send(self, text: str) -> bool:
+        if not self.token or not self.chat_id:
+            logger.warning("Telegram not configured — skipping send.")
+            return False
+        try:
+            r = requests.post(
+                f"{self._base}/sendMessage",
+                json={
+                    "chat_id":    self.chat_id,
+                    "text":       text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+                timeout=30,
+            )
+            ok = r.status_code == 200
+            if not ok:
+                logger.error("Telegram HTTP %s: %s", r.status_code, r.text[:200])
+            return ok
+        except Exception as exc:
+            logger.error("Telegram send error: %s", exc)
+            return False
+
+    # ------------------------------------------------------------------
+    def send_opportunity(self, rank: int, proposal: Any, top_n: int = 10) -> bool:
+        """Format one InvestmentProposal as an HTML Telegram block."""
+        try:
+            p = proposal
+            dir_up = str(getattr(p,"direction","")).upper() == "LONG"
+            emoji_dir = "🟢 LONG" if dir_up else "🔴 SHORT"
+            grade_emoji = {
+                "A+":"⭐⭐⭐⭐⭐","A":"⭐⭐⭐⭐","B+":"⭐⭐⭐",
+                "B":"⭐⭐","C":"⭐","LOW":"⚪",
+            }.get(getattr(p,"ai_grade",""), "⚪")
+
+            def fmt(v, dp=2):
+                try: return f"{float(v):.{dp}f}"
+                except Exception: return str(v) if v is not None else "N/A"
+
+            tp1_s, tp2_s, tp3_s = fmt(getattr(p,"tp_1",0)), fmt(getattr(p,"tp_2",0)), fmt(getattr(p,"tp_3",0))
+            rr_lbl   = f"{safe_num(getattr(p,'risk_reward',1)):.1f}:1"
+            rr_ext   = f"{safe_num(getattr(p,'risk_reward_extended',1)):.1f}:1"
+            conff    = f"{safe_num(getattr(p,'ai_confidence',0)):.0f}%"
+            sym      = _esc_html(getattr(p,"symbol","?"))
+            grade    = _esc_html(getattr(p,"ai_grade","—"))
+
+            thesis_lines = (getattr(p,"thesis","") or "No thesis available").strip().splitlines()
+            thesis_md    = "\n".join(f"  • {_esc_html(l)}" for l in thesis_lines[:3])
+            top_sigs     = (getattr(p,"signals",[]) or [])[:4]
+            sig_md       = "\n".join(f"  ✓ {_esc_html(s)}" for s in top_sigs) if top_sigs else "  —"
+
+            ac         = getattr(p,"analyst_consensus",{}) or {}
+            ac_label   = ac.get("label","N/A")
+            ac_score   = fmt(ac.get("score",0),0)
+            hold_per   = _esc_html(getattr(p,"hold_period","—") or "—")
+
+            block = [
+                f"<b>#{rank}  {sym}</b>  {emoji_dir}",
+                "",
+                f"💰 <b>Entry:</b>  <code>{fmt(getattr(p,'entry_price',0))}</code>",
+                f"🛑 <b>Stop Loss:</b> <code>{fmt(getattr(p,'stop_loss',0))}</code>",
+                f"🎯 <b>TP1:</b> <code>{tp1_s}</code>  <b>TP2:</b> <code>{tp2_s}</code>  <b>TP3:</b> <code>{tp3_s}</code>",
+                f"📊 <b>RR:</b> {rr_lbl} (ext: {rr_ext})",
+                f"⭐ <b>Grade:</b> {grade_emoji}  {grade}  ({conff})",
+                f"📰 <b>Analysts:</b> {ac_label} ({ac_score})",
+                f"⏱ <b>Hold:</b> {hold_per}",
+                "",
+                f"📌 <b>Thesis:</b>",
+                thesis_md,
+                "",
+                f"🔑 <b>Signals:</b>",
+                sig_md,
+                "",
+                f"<i>For informational purposes only — not financial advice.</i>",
+            ]
+            return self.send("\n".join(block))
+        except Exception as exc:
+            logger.error("send_opportunity error: %s", exc)
+            return False
+
+    # ------------------------------------------------------------------
+    def send_header(self, market_regime: Dict[str, Any], total_scanned: int = 0,
+                    top10_mix: Optional[Dict[str, int]] = None, top_n: int = 10) -> bool:
+        regime = str(market_regime.get("_overall","UNKNOWN"))
+        score  = str(market_regime.get("_score","?"))
+        bias   = (market_regime.get("_bias") or {}).get("direction","—")
+        ts     = _esc_html(
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        )
+
+        emoji = {
+            "STRONG_BULL":"🚀","BULL":"📈","NEUTRAL":"➡️",
+            "CAUTIOUS":"⚠️","BEAR":"📉","STRONG_BEAR":"🔻",
+        }.get(regime,"❓")
+
+        lines = [f"{emoji} <b>Scanner Report — Top {top_n} Opportunities</b>",
+                 f"📊 Market: <b>{_esc_html(regime)}</b> (score {score})  |  Bias: <b>{_esc_html(str(bias))}</b>"]
+        if top10_mix:
+            mix_str = "  ".join(f"<b>{k}</b>: {v}" for k,v in sorted(top10_mix.items(), key=lambda x:-x[1]))
+            lines.append(f"🏗 Top-10 mix → {mix_str}")
+        lines.append(f"🌐 Universe: {total_scanned} US equities  |  🕐 {ts}")
+        return self.send("\n".join(lines))
+
+    def send_footer(self, n_shown: int) -> bool:
+        return self.send(
+            f"ℹ️ Showing top {n_shown} opportunities.\n"
+            f"⚠️ <i>For informational purposes only. Not financial advice.</i>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Stock universe (sourced from telegram_scanner.py — single source of truth)
+# ---------------------------------------------------------------------------
+
+_UNIVERSE_CATALOG: Dict[str, Dict[str, str]] = {
+    # ── MEGA TECHNOLOGY ($300B+) ──────────────────────────────────────────────
+    "AAPL":{"opp":"MOMENTUM","cap":"MEGA","sector":"Technology"},
+    "MSFT":{"opp":"GROWTH","cap":"MEGA","sector":"Technology"},
+    "NVDA":{"opp":"BREAKOUT","cap":"MEGA","sector":"Semiconductors"},
+    "GOOGL":{"opp":"MOMENTUM","cap":"MEGA","sector":"Technology"},
+    "GOOG":{"opp":"MOMENTUM","cap":"MEGA","sector":"Technology"},
+    "AMZN":{"opp":"BREAKOUT","cap":"MEGA","sector":"Consumer Disc."},
+    "META":{"opp":"BREAKOUT","cap":"MEGA","sector":"Technology"},
+    "TSLA":{"opp":"BREAKOUT","cap":"MEGA","sector":"Consumer Disc."},
+    "AVGO":{"opp":"GROWTH","cap":"MEGA","sector":"Semiconductors"},
+    "ORCL":{"opp":"MOMENTUM","cap":"MEGA","sector":"Technology"},
+    "BRK-B":{"opp":"VALUE","cap":"MEGA","sector":"Financials"},
+    "TSM":{"opp":"GROWTH","cap":"MEGA","sector":"Semiconductors"},
+    "CRM":{"opp":"MOMENTUM","cap":"LARGE","sector":"Technology"},
+    "ADBE":{"opp":"GROWTH","cap":"LARGE","sector":"Technology"},
+    "AMD":{"opp":"BREAKOUT","cap":"LARGE","sector":"Semiconductors"},
+    "INTC":{"opp":"TURNAROUND","cap":"LARGE","sector":"Semiconductors"},
+    "PLTR":{"opp":"BREAKOUT","cap":"LARGE","sector":"Technology"},
+    "NOW":{"opp":"GROWTH","cap":"LARGE","sector":"Technology"},
+    "UBER":{"opp":"MOMENTUM","cap":"LARGE","sector":"Technology"},
+    "SHOP":{"opp":"BREAKOUT","cap":"LARGE","sector":"Technology"},
+    "PANW":{"opp":"MOMENTUM","cap":"LARGE","sector":"Technology"},
+    "SNOW":{"opp":"GROWTH","cap":"LARGE","sector":"Technology"},
+    "ARM":{"opp":"GROWTH","cap":"LARGE","sector":"Semiconductors"},
+    "MSTR":{"opp":"BREAKOUT","cap":"LARGE","sector":"Financials"},
+    "COIN":{"opp":"BREAKOUT","cap":"LARGE","sector":"Financials"},
+    "JPM":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "BAC":{"opp":"VALUE","cap":"LARGE","sector":"Financials"},
+    "WFC":{"opp":"TURNAROUND","cap":"LARGE","sector":"Financials"},
+    "GS":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "MS":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "BLK":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "SCHW":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "AXP":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "C":{"opp":"VALUE","cap":"LARGE","sector":"Financials"},
+    "V":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "MA":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "PYPL":{"opp":"TURNAROUND","cap":"LARGE","sector":"Financials"},
+    "UNH":{"opp":"MOMENTUM","cap":"LARGE","sector":"Healthcare"},
+    "LLY":{"opp":"BREAKOUT","cap":"LARGE","sector":"Healthcare"},
+    "JNJ":{"opp":"VALUE","cap":"LARGE","sector":"Healthcare"},
+    "PFE":{"opp":"TURNAROUND","cap":"LARGE","sector":"Healthcare"},
+    "ABBV":{"opp":"MOMENTUM","cap":"LARGE","sector":"Healthcare"},
+    "MRK":{"opp":"MOMENTUM","cap":"LARGE","sector":"Healthcare"},
+    "ABT":{"opp":"MOMENTUM","cap":"LARGE","sector":"Healthcare"},
+    "TMO":{"opp":"MOMENTUM","cap":"LARGE","sector":"Healthcare"},
+    "DHR":{"opp":"MOMENTUM","cap":"LARGE","sector":"Healthcare"},
+    "NVO":{"opp":"GROWTH","cap":"LARGE","sector":"Healthcare"},
+    "AZN":{"opp":"GROWTH","cap":"LARGE","sector":"Healthcare"},
+    "BMY":{"opp":"VALUE","cap":"LARGE","sector":"Healthcare"},
+    "GILD":{"opp":"TURNAROUND","cap":"LARGE","sector":"Healthcare"},
+    "BIIB":{"opp":"BREAKOUT","cap":"LARGE","sector":"Healthcare"},
+    "VRTX":{"opp":"BREAKOUT","cap":"LARGE","sector":"Healthcare"},
+    "WMT":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Staples"},
+    "COST":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Staples"},
+    "PG":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Staples"},
+    "KO":{"opp":"VALUE","cap":"LARGE","sector":"Consumer Staples"},
+    "PEP":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Staples"},
+    "MCD":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Disc."},
+    "NKE":{"opp":"TURNAROUND","cap":"LARGE","sector":"Consumer Disc."},
+    "HD":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Disc."},
+    "LOW":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Disc."},
+    "TGT":{"opp":"TURNAROUND","cap":"LARGE","sector":"Consumer Disc."},
+    "SBUX":{"opp":"TURNAROUND","cap":"MID","sector":"Consumer Disc."},
+    "CMG":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Disc."},
+    "CAT":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
+    "DE":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
+    "GE":{"opp":"BREAKOUT","cap":"LARGE","sector":"Industrials"},
+    "UPS":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
+    "BA":{"opp":"TURNAROUND","cap":"LARGE","sector":"Industrials"},
+    "HON":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
+    "RTX":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
+    "LMT":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
+    "XOM":{"opp":"MOMENTUM","cap":"LARGE","sector":"Energy"},
+    "CVX":{"opp":"MOMENTUM","cap":"LARGE","sector":"Energy"},
+    "COP":{"opp":"MOMENTUM","cap":"LARGE","sector":"Energy"},
+    "SLB":{"opp":"BREAKOUT","cap":"LARGE","sector":"Energy"},
+    "TXN":{"opp":"MOMENTUM","cap":"LARGE","sector":"Semiconductors"},
+    "QCOM":{"opp":"MOMENTUM","cap":"LARGE","sector":"Semiconductors"},
+    "MU":{"opp":"BREAKOUT","cap":"LARGE","sector":"Semiconductors"},
+    "AMAT":{"opp":"BREAKOUT","cap":"LARGE","sector":"Semiconductors"},
+    "LRCX":{"opp":"MOMENTUM","cap":"LARGE","sector":"Semiconductors"},
+    "KLAC":{"opp":"MOMENTUM","cap":"LARGE","sector":"Semiconductors"},
+    "ASML":{"opp":"GROWTH","cap":"LARGE","sector":"Semiconductors"},
+    "NFLX":{"opp":"MOMENTUM","cap":"LARGE","sector":"Comm. Services"},
+    "DIS":{"opp":"TURNAROUND","cap":"LARGE","sector":"Comm. Services"},
+    "CMCSA":{"opp":"VALUE","cap":"LARGE","sector":"Comm. Services"},
+    "VZ":{"opp":"VALUE","cap":"LARGE","sector":"Comm. Services"},
+    "NEE":{"opp":"GROWTH","cap":"LARGE","sector":"Utilities"},
+    "DUK":{"opp":"VALUE","cap":"LARGE","sector":"Utilities"},
+    "SO":{"opp":"VALUE","cap":"LARGE","sector":"Utilities"},
+    "D":{"opp":"VALUE","cap":"LARGE","sector":"Utilities"},
+    "AEP":{"opp":"VALUE","cap":"LARGE","sector":"Utilities"},
+    "EXC":{"opp":"VALUE","cap":"LARGE","sector":"Utilities"},
+    "CEG":{"opp":"BREAKOUT","cap":"LARGE","sector":"Utilities"},
+    "SRE":{"opp":"MOMENTUM","cap":"LARGE","sector":"Utilities"},
+    "LIN":{"opp":"MOMENTUM","cap":"LARGE","sector":"Materials"},
+    "APD":{"opp":"MOMENTUM","cap":"LARGE","sector":"Materials"},
+    "SHW":{"opp":"MOMENTUM","cap":"LARGE","sector":"Materials"},
+    "FCX":{"opp":"MOMENTUM","cap":"LARGE","sector":"Materials"},
+    "PLD":{"opp":"MOMENTUM","cap":"LARGE","sector":"Real Estate"},
+    "EQIX":{"opp":"GROWTH","cap":"LARGE","sector":"Real Estate"},
+    "CRWD":{"opp":"BREAKOUT","cap":"MID","sector":"Technology"},
+    "ZS":{"opp":"GROWTH","cap":"MID","sector":"Technology"},
+    "DDOG":{"opp":"GROWTH","cap":"MID","sector":"Technology"},
+    "FTNT":{"opp":"BREAKOUT","cap":"MID","sector":"Technology"},
+    "NET":{"opp":"BREAKOUT","cap":"MID","sector":"Technology"},
+    "APP":{"opp":"BREAKOUT","cap":"MID","sector":"Technology"},
+    "DKNG":{"opp":"BREAKOUT","cap":"LARGE","sector":"Consumer Disc."},
+    "CCL":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Disc."},
+    "MAR":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Disc."},
+    "HLT":{"opp":"GROWTH","cap":"LARGE","sector":"Consumer Disc."},
+    "LULU":{"opp":"BREAKOUT","cap":"LARGE","sector":"Consumer Disc."},
+    "OXY":{"opp":"MOMENTUM","cap":"LARGE","sector":"Energy"},
+    "SMCI":{"opp":"BREAKOUT","cap":"MID","sector":"Technology"},
+    "LLY1":{"opp":"BREAKOUT","cap":"MID","sector":"Healthcare"},
+    "BMRN":{"opp":"BREAKOUT","cap":"LARGE","sector":"Healthcare"},
+    "VRTX1":{"opp":"BREAKOUT","cap":"LARGE","sector":"Healthcare"},
+    "SYK":{"opp":"MOMENTUM","cap":"LARGE","sector":"Healthcare"},
+    "CATY":{"opp":"MOMENTUM","cap":"MID","sector":"Financials"},
+    "FITB":{"opp":"VALUE","cap":"LARGE","sector":"Financials"},
+    "PGR":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "TRV":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "ALL":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "SPGI":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "MSCI":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "ICE":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "CME":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
+    "MDB":{"opp":"BREAKOUT","cap":"MID","sector":"Technology"},
+    "MSTR":{"opp":"BREAKOUT","cap":"LARGE","sector":"Financials"},
+    "DOCU":{"opp":"TURNAROUND","cap":"LARGE","sector":"Technology"},
+    "TEAM":{"opp":"TURNAROUND","cap":"MID","sector":"Technology"},
+    "ZM":{"opp":"TURNAROUND","cap":"LARGE","sector":"Technology"},
+    "SQ":{"opp":"TURNAROUND","cap":"LARGE","sector":"Technology"},
+    "PYPL":{"opp":"TURNAROUND","cap":"LARGE","sector":"Financials"},
+    "COST":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Staples"},
+    "TXN":{"opp":"MOMENTUM","cap":"LARGE","sector":"Semiconductors"},
+    "WMB":{"opp":"GROWTH","cap":"LARGE","sector":"Energy"},
+    "FDX":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
+    "FAST":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
+    "PAYX":{"opp":"MOMENTUM","cap":"LARGE","sector":"Technology"},
+    "EFX":{"opp":"MOMENTUM","cap":"LARGE","sector":"Technology"},
+    "CTAS":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
+    "ODFL":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
+}
+
+# Canonical, deduplicated, ordered scan list
+_STOCK_UNIVERSE: List[str] = list(dict.fromkeys(_UNIVERSE_CATALOG.keys()))
+
+# Rank/score belt thresholds (echo telegram_scanner.py)
+_CAP_TIER_WEIGHT: Dict[str, float] = {"MEGA":1.0,"LARGE":2.0,"MID":5.0,"SMALL":9.0}
+_OPP_BOOST:       Dict[str, float] = {
+    "BREAKOUT":12.0,"MOMENTUM":9.0,"GROWTH":7.0,"VALUE":4.0,"TURNAROUND":6.0,
+}
+
+# Shared scan constants
+_SCAN_WORKERS:       int = 8
+_SCAN_TIMEOUT_S:     int = 30
+_MIN_CONFIDENCE:     float = 48.0
+
+# Auto-scan state
+_LAST_SCAN_AT:   Optional[datetime] = None
+_AUTO_SCAN_LOCK = threading.Lock()          # prevents overlapping runs
+_auto_scan_log:  List[str] = []             # bounded circular buffer of log lines
+
+
+# ---------------------------------------------------------------------------
+# Reusable scan runner + Telegram dispatcher (called by Streamlit toggle AND
+# by telegram_scanner.py --once / --scheduled modes)
+# ---------------------------------------------------------------------------
+
+def _run_scan_job(
+    notifier:   TelegramNotifier,
+    scanner:    "MarketScanner",
+    top_n:      int = 10,
+    min_conf:   float = _MIN_CONFIDENCE,
+    send_empty: bool = False,
+) -> None:
+    """Execute one full scan and push results to Telegram."""
+    global _LAST_SCAN_AT
+
+    if not _AUTO_SCAN_LOCK.acquire(blocking=False):
+        logger.info("Scan already in progress — skipping this tick.")
+        return
+
+    ts_start = datetime.now(timezone.utc)
+    try:
+        logger.info(
+            "Scan job fired — %s", ts_start.strftime("%Y-%m-%d %H:%M:%S UTC")
+        )
+        _auto_scan_log.append(
+            f"[{ts_start.strftime('%H:%M:%S')}] Scan started"
+        )
+        if len(_auto_scan_log) > 50:
+            _auto_scan_log.pop(0)
+
+        ranked = scanner.scan()
+
+        if not ranked:
+            if send_empty:
+                notifier.send(
+                    f"📭 <b>Scan complete — no qualifying opportunities</b>\n"
+                    f"🕐 {ts_start.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                    f"All {len(scanner.universe)} symbols below confidence floor."
+                )
+            logger.info("No proposals. Silent skip (send_empty=%s).", send_empty)
+            return
+
+        # Category mix for header
+        mix: Dict[str, int] = {}
+        for p in ranked[:top_n]:
+            key = f"{getattr(p,'_cap_tier','?')}/{getattr(p,'_opp_type','?')}"
+            mix[key] = mix.get(key, 0) + 1
+
+        # Header → each opportunity → footer
+        notifier.send_header(
+            {"_overall":"RUN","_score":0,"_bias":{"direction":"—"}},
+            total_scanned=len(scanner.universe),
+            top10_mix=mix,
+            top_n=top_n,
+        )
+        for rank, p in enumerate(ranked[:top_n], 1):
+            notifier.send_opportunity(rank, p, top_n=top_n)
+            time.sleep(0.4)  # Telegram rate-limit friendly
+        notifier.send_footer(min(top_n, len(ranked)))
+
+        logger.info(
+            "Telegram batch sent — %d proposals, %d shared.",
+            len(ranked[:top_n]), len(mix),
+        )
+        _auto_scan_log.append(
+            f"[{ts_start.strftime('%H:%M:%S')}] Sent {min(top_n,len(ranked))} / {len(ranked)}"
+        )
+    except Exception:
+        logger.exception("scan_job crashed")
+        _auto_scan_log.append(
+            f"[{ts_start.strftime('%H:%M:%S')}] CRASHED — see logs"
+        )
+    finally:
+        _LAST_SCAN_AT = datetime.now(timezone.utc)
+        _AUTO_SCAN_LOCK.release()
+
+
+# ---------------------------------------------------------------------------
+# Background daemon thread — runs schedule loop forever
+# ---------------------------------------------------------------------------
+
+def _auto_scan_daemon() -> None:
+    """Background thread: scan every _AUTO_SCAN_INTERVAL_HOURS and push Telegram alerts."""
+    sched = schedule.Scheduler()
+
+    notifier = TelegramNotifier()
+    scanner  = MarketScanner(workers=_SCAN_WORKERS)
+
+    # Fire immediately so the first scan isn't delayed by one interval
+    sched.every(_AUTO_SCAN_INTERVAL_HOURS).hours.do(
+        _run_scan_job, notifier, scanner
+    )
+    logger.info(
+        "Auto-scan: every %.1f h  |  Freq: %d workers  |  Min confidence: %.0f",
+        _AUTO_SCAN_INTERVAL_HOURS, _SCAN_WORKERS, _MIN_CONFIDENCE,
+    )
+
+    while True:
+        try:
+            sched.run_pending()
+        except Exception:
+            logger.exception("Auto-scan scheduler error")
+        time.sleep(30)
+
+
+def start_auto_scan(
+    interval_hours: float = _AUTO_SCAN_INTERVAL_HOURS,
+    workers:        int   = _SCAN_WORKERS,
+    min_conf:       float = _MIN_CONFIDENCE,
+) -> threading.Thread | None:
+    """Start the background auto-scan daemon thread (once only)."""
+    global _AUTO_SCAN_INTERVAL_HOURS, _AUTO_SCAN_INTERVAL_SECS
+    global _SCAN_WORKERS, _MIN_CONFIDENCE
+
+    _AUTO_SCAN_INTERVAL_HOURS = float(interval_hours)
+    _AUTO_SCAN_INTERVAL_SECS  = int(_AUTO_SCAN_INTERVAL_HOURS * 3600)
+    _SCAN_WORKERS              = int(workers)
+    _MIN_CONFIDENCE            = float(min_conf)
+
+    th = threading.Thread(target=_auto_scan_daemon, daemon=True, name="AutoScan")
+    th.start()
+    logger.info(
+        "Auto-scan daemon started — interval=%.1f h", _AUTO_SCAN_INTERVAL_HOURS,
+    )
+    return th
 
 
 # ===============================================
@@ -5623,7 +6109,6 @@ def main_ui():
     # SIDEBAR CONFIG (UPGRADED)
     # =========================================================
     st.sidebar.header("⚙️ Configuration")
-
     # -------------------------
     # SCAN MODE
     # -------------------------
@@ -5720,6 +6205,75 @@ def main_ui():
         "Force ML retrain (ignore disk cache)",
         value=False,
     )
+
+    # ── Auto-Scan (Telegram alerts every 4 h when enabled) ───────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📡 Auto-Scan (Telegram)")
+
+    def _ensure_auto_scan_thread() -> None:
+        """Start the background auto-scan daemon (every interval_hours, guarded to one thread)."""
+        guard = st.session_state.get("auto_scan_thread")
+        if guard is not None:
+            return   # daemon already running
+        try:
+            interval_h: float = float(st.session_state.get("auto_scan_interval_h", 4.0))
+            _th = start_auto_scan(interval_hours=interval_h)
+            st.session_state.auto_scan_thread = _th
+            logger.info("Auto-scan daemon interval set to %.1f h", interval_h)
+        except Exception as _exc:
+            logger.error("auto_scan start failed: %s", _exc)
+
+    # Toggle and interval live in session_state so change-callbacks are stable
+    # across Streamlit reruns
+    if "auto_scan_enabled" not in st.session_state:
+        st.session_state.auto_scan_enabled = False
+    if "auto_scan_interval_h" not in st.session_state:
+        st.session_state.auto_scan_interval_h = 4.0
+
+    st.sidebar.checkbox(
+        "Enable auto-scan",
+        value=st.session_state.auto_scan_enabled,
+        key="auto_scan_enabled",
+        on_change=_ensure_auto_scan_thread,
+        help=(
+            "Runs the stock universe scan in the background every "
+            f"{st.session_state.auto_scan_interval_h:.0f} h and pushes the "
+            "top 10 opportunities to the Telegram chat."
+        ),
+    )
+
+    st.sidebar.number_input(
+        "Scan interval (hours)",
+        min_value=1.0,
+        max_value=24.0,
+        value=float(st.session_state.auto_scan_interval_h),
+        step=0.5,
+        key="auto_scan_interval_h",
+        on_change=_ensure_auto_scan_thread,
+    )
+
+    if st.session_state.get("auto_scan_enabled"):
+        last_at = _LAST_SCAN_AT
+        if last_at is not None:
+            ago  = datetime.now(timezone.utc) - last_at
+            ago_h   = ago.total_seconds() / 3600.0
+            next_in = max(0.0, _AUTO_SCAN_INTERVAL_SECS - ago.total_seconds())
+            next_h  = next_in / 3600.0
+            st.sidebar.caption(
+                f"Last run: **{ago_h:.1f} h ago**  ·  Next in: **{next_h:.1f} h**"
+            )
+            if "auto_scan_thread" not in st.session_state:
+                _ensure_auto_scan_thread()
+        else:
+            st.sidebar.caption("No scan yet — first run will fire shortly.")
+            _ensure_auto_scan_thread()
+
+        if _auto_scan_log:
+            with st.sidebar.expander("Recent auto-scan log", expanded=False):
+                for _line in reversed(_auto_scan_log[-10:]):
+                    st.caption(_line)
+    else:
+        st.sidebar.caption("Auto-scan is **OFF**.")
     # =========================================================
     # HELPERS
     # =========================================================
@@ -5761,13 +6315,10 @@ def main_ui():
             ref: Dict[str, Any] = {}
             if ac == "Crypto":
                 try:
-                    btc = yf.download(
-                        "BTC-USD",
-                        period="6mo",
-                        interval="1d",
-                        progress=False,
-                        auto_adjust=True,
-                        threads=False,
+                    btc = _yf_call(
+                        yf.download,
+                        "BTC-USD", period="6mo", interval="1d",
+                        progress=False, auto_adjust=True, threads=False,
                     )
                     btc = normalize_ohlcv(btc)
                     r = ProposalEngine._return_n_bars_pct(btc, 22)
@@ -5777,13 +6328,10 @@ def main_ui():
                     pass
             elif ac == "Forex":
                 try:
-                    dxy = yf.download(
-                        "DX-Y.NYB",
-                        period="6mo",
-                        interval="1d",
-                        progress=False,
-                        auto_adjust=True,
-                        threads=False,
+                    dxy = _yf_call(
+                        yf.download,
+                        "DX-Y.NYB", period="6mo", interval="1d",
+                        progress=False, auto_adjust=True, threads=False,
                     )
                     dxy = normalize_ohlcv(dxy)
                     r = ProposalEngine._return_n_bars_pct(dxy, 22)
@@ -5807,7 +6355,7 @@ def main_ui():
 
         def fetch(sym):
             try:
-                tf = fetch_multi_timeframe(sym)
+                tf = _yf_call(fetch_multi_timeframe, sym)
                 df = tf.get("daily")
                 if df is None or len(df) == 0:
                     return None
