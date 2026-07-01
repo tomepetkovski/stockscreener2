@@ -20,7 +20,7 @@ import yfinance as yf
 import plotly.graph_objects as go
 import plotly.figure_factory as ff
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass, field
 import logging
@@ -36,6 +36,7 @@ import requests
 import schedule
 import threading
 import time
+import random
 from typing import Dict, Any, Optional, List
 logger = logging.getLogger(__name__)
 
@@ -48,18 +49,6 @@ from types import SimpleNamespace
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("InstitutionalEngine_v4")
-from typing import Dict, Optional
-import pandas as pd
-import yfinance as yf
-import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import requests
-import yfinance as yf
-
-
-
-import time
 
 
 # =====================================================
@@ -90,6 +79,8 @@ class _YFSilentBuffer(_io.StringIO):
 
 _yf_buf = _YFSilentBuffer()
 
+_yf_error_401_count = 0   # global Yahoo Finance 401 counter (rate-limit throttle)
+
 def _yf_call(fn, *args, **kwargs):
     """Run fn(*args, **kwargs) with sys.stderr pointed at Yahoo-spam filter."""
     old = _sys.stderr
@@ -102,11 +93,25 @@ def _yf_call(fn, *args, **kwargs):
 
 def safe_yf_download(*args, retries=3, **kwargs):
 
+    global _yf_error_401_count
+
+    # Honour active back-off window triggered by repeated 401s
+    now_ts = time.time()
+
+    if getattr(safe_yf_download, "_backoff_until", 0.0) > now_ts:
+
+        remaining = safe_yf_download._backoff_until - now_ts
+
+        logger.warning("YF back-off active — %.0fs remaining", remaining)
+
+        time.sleep(remaining)
+
     for attempt in range(retries):
 
         try:
 
-            data = yf.download(
+            data = _yf_call(
+                yf.download,
                 *args,
                 progress=False,
                 threads=False,
@@ -114,77 +119,316 @@ def safe_yf_download(*args, retries=3, **kwargs):
             )
 
             if data is not None and not data.empty:
+                # Reset back-off on success
+                safe_yf_download._backoff_until = 0.0
+                _yf_error_401_count = 0
                 return data
 
         except Exception as e:
 
-            logger.warning(
-                "Yahoo download retry %s failed | error=%s",
-                attempt + 1,
-                str(e)
-            )
+            _err = str(e)
 
-            time.sleep(1.5)
+            if "401" in _err or "Unauthorized" in _err or "Invalid Crumb" in _err:
+
+                _yf_error_401_count += 1
+
+                logger.warning(
+                    "YF 401 [%s] | count=%d | retry %d/%d — sleeping 3 s",
+                    args[0] if args else "?",
+                    _yf_error_401_count,
+                    attempt + 1, retries,
+                )
+
+                # After 3 consecutive 401s, back off for 60 s across all callers
+                if _yf_error_401_count >= 3:
+
+                    backoff_secs = 60
+
+                    safe_yf_download._backoff_until = time.time() + backoff_secs
+
+                    logger.warning(
+                        "YF api rate-limit — backing off ALL requests for %ds",
+                        backoff_secs,
+                    )
+
+                time.sleep(2.0 * (attempt + 1))  # escalating: 2 s / 4 s / 6 s
+
+            else:
+
+                logger.warning(
+                    "Yahoo download retry %s failed | error=%s",
+                    attempt + 1, _err
+                )
+
+                time.sleep(1.5)
 
     return pd.DataFrame()
 
 
 # ===============================================
-# AUTO-SCAN + TELEGRAM NOTIFICATION INFRASTRUCTURE
+# TELEGRAM NOTIFICATION INFRASTRUCTURE
 # ===============================================
 
-# --- Timing ---
+_TG_BOT_TOKEN_RAW: str = os.environ.get("TELEGRAM_BOT_TOKEN", "7608970630:AAH5YDKlFdRrxp5pLAwNvoCq4yqIQTTm0yE")
+_TG_CHAT_ID_RAW  : str = os.environ.get("TELEGRAM_CHAT_ID",   "599669892")
+
+def _get_telegram_config() -> tuple[str, str, str]:
+    """
+    Get Telegram configuration from environment variables or Streamlit secrets.
+    Returns (bot_token, chat_id, api_url).
+    Prioritize: environment variables > Streamlit secrets > empty.
+    """
+    bot_token = _TG_BOT_TOKEN_RAW
+    chat_id = _TG_CHAT_ID_RAW
+
+    # Try Streamlit secrets if available (only in Streamlit context)
+    try:
+        import streamlit as st
+        if hasattr(st, 'secrets') and 'telegram' in st.secrets:
+            secrets = st.secrets['telegram']
+            if not bot_token and 'bot_token' in secrets:
+                bot_token = str(secrets['bot_token'])
+            if not chat_id and 'chat_id' in secrets:
+                chat_id = str(secrets['chat_id'])
+    except Exception:
+        pass  # Streamlit not available or secrets not configured
+
+    api_url = f"https://api.telegram.org/bot{bot_token}" if bot_token else ""
+    return bot_token, chat_id, api_url
+
+_TG_BOT_TOKEN, _TG_CHAT_ID, _TG_API_URL = _get_telegram_config()
+
+if not _TG_BOT_TOKEN:
+    logger = logging.getLogger("InstitutionalEngine_v4")
+    logger.warning(
+        "⚠️  Telegram not configured — TELEGRAM_BOT_TOKEN environment variable not set. "
+        "Set env-var TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID or configure Streamlit secrets to enable Telegram alerts."
+    )
+
+# Module-level Telegram delivery counters (shared across daemon + main thread)
+_TG_SENT_TOTAL : int = 0
+_TG_FAIL_TOTAL : int = 0
+
+# Scan / timing constants (must be defined before start_auto_scan / _run_scan_job)
 _AUTO_SCAN_INTERVAL_HOURS: float = 4.0
-_AUTO_SCAN_INTERVAL_SECS: int  = int(_AUTO_SCAN_INTERVAL_HOURS * 3600)
+_AUTO_SCAN_INTERVAL_SECS: int   = int(_AUTO_SCAN_INTERVAL_HOURS * 3600)
+_SCAN_WORKERS: int = 8
+_SCAN_TIMEOUT_S: int = 30
+_MIN_CONFIDENCE: float = 48.0
 
-# --- Telegram configuration (override via env-var) ---
-_TG_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "") or "7608970630:AAH5YDKlFdRrxp5pLAwNvoCq4yqIQTTm0yE"
-_TG_CHAT_ID:   str = os.environ.get("TELEGRAM_CHAT_ID",   "") or "-1002385326575"
-_TG_API_URL:   str = f"https://api.telegram.org/bot{_TG_BOT_TOKEN}"
+# Auto-scan state
+_LAST_SCAN_AT:   Optional[datetime] = None
+_AUTO_SCAN_LOCK = threading.Lock()
+_auto_scan_log:  List[str] = []
 
-
-# ---------------------------------------------------------------------------
-# HTML escape helper (used by Telegram notifier)
-# ---------------------------------------------------------------------------
 
 def _esc_html(text: str) -> str:
     return text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 
-# ---------------------------------------------------------------------------
-# TelegramNotifier
-# ---------------------------------------------------------------------------
-
 class TelegramNotifier:
-    """Thin wrapper around the Telegram Bot HTTP API (HTML parse-mode)."""
+    """Production-grade Telegram Bot API wrapper.
+
+    Features
+    --------
+    * Exponential-backoff retry on 429 / 5xx / connection errors
+    * Per-message rate-limit (default 1.1 s between sends, under Telegram's
+      1 msg/s per-chat guidance)
+    * Connection smoke-test at construction time
+    * Public counters: ``sent_count`` / ``fail_count``
+    * Returns ``(ok: bool, status_code: int | None, detail: str)`` from
+      ``send()`` so callers can inspect failures.
+    """
+
+    # ---- constants ----
+    _MAX_RETRIES        : int  = 10
+    _BASE_BACKOFF_S     : float = 2.0
+    _MAX_BACKOFF_S      : float = 30.0
+    _RATE_LIMIT_DELAY_S : float = 1.1    # stay under Telegram's 1 msg/s
 
     def __init__(self, token: str = _TG_BOT_TOKEN, chat_id: str = _TG_CHAT_ID):
         self.token   = token or _TG_BOT_TOKEN
         self.chat_id = chat_id or _TG_CHAT_ID
         self._base   = f"https://api.telegram.org/bot{self.token}"
+        self.sent_count  : int = 0
+        self.fail_count  : int = 0
+        self._last_send   : float | None = None
+        self._connected   : bool = False   # True after successful getMe probe
 
+        # ── Connection smoke-test (non-fatal) ──────────────────────────────
+        try:
+            resp = requests.get(
+                f"{self._base}/getMe", timeout=10,
+            )
+            if resp.status_code == 200:
+                self._connected = True
+                logger.info("Telegram bot connected OK (getMe 200).")
+            else:
+                logger.warning(
+                    "Telegram getMe returned HTTP %s — check token.",
+                    resp.status_code,
+                )
+        except Exception as exc:
+            logger.warning("Telegram connection probe failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    def _wait_rate_limit(self) -> None:
+        if self._last_send is not None:
+            elapsed = time.monotonic() - self._last_send
+            remaining = self._RATE_LIMIT_DELAY_S - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
+    # ------------------------------------------------------------------
     def send(self, text: str) -> bool:
+        """Send *text* to the configured chat.
+
+        Retries up to ``_MAX_RETRIES`` times with jittered exponential
+        back-off on 429 / 5xx / connection errors.
+        Returns ``True`` on HTTP 200, ``False`` otherwise.
+        """
         if not self.token or not self.chat_id:
             logger.warning("Telegram not configured — skipping send.")
+            self.fail_count += 1
             return False
-        try:
-            r = requests.post(
-                f"{self._base}/sendMessage",
-                json={
-                    "chat_id":    self.chat_id,
-                    "text":       text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-                timeout=30,
-            )
-            ok = r.status_code == 200
-            if not ok:
-                logger.error("Telegram HTTP %s: %s", r.status_code, r.text[:200])
-            return ok
-        except Exception as exc:
-            logger.error("Telegram send error: %s", exc)
-            return False
+
+        backoff = self._BASE_BACKOFF_S
+        jitter = lambda: random.uniform(0, 0.5 * backoff)
+
+        for attempt in range(1, self._MAX_RETRIES + 1):
+            try:
+                self._wait_rate_limit()
+
+                r = requests.post(
+                    f"{self._base}/sendMessage",
+                    json={
+                        "chat_id"              : self.chat_id,
+                        "text"                 : text,
+                        "parse_mode"           : "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=30,
+                )
+
+                self._last_send = time.monotonic()
+
+                if r.status_code == 200:
+                    self.sent_count += 1
+                    return True
+
+                # ── Non-200 — qualify error ──────────────────────────────
+                detail = r.text[:300]
+                if r.status_code in (429,):          # Too Many Requests
+                    logger.warning(
+                        "Telegram 429 (attempt %d/%d) — backing off %.1fs: %s",
+                        attempt, self._MAX_RETRIES, backoff, detail,
+                    )
+                elif r.status_code in (401, 403):    # Auth / forbidden
+                    logger.error(
+                        "Telegram %s — check token/chat-id: %s",
+                        r.status_code, detail,
+                    )
+                    self.fail_count += 1
+                    return False                      # no point retrying
+                elif 500 <= r.status_code < 600:     # Server error
+                    logger.warning(
+                        "Telegram %s (attempt %d/%d) — retrying: %s",
+                        r.status_code, attempt, self._MAX_RETRIES, detail,
+                    )
+                else:
+                    logger.error(
+                        "Telegram HTTP %s (attempt %d): %s",
+                        r.status_code, attempt, detail,
+                    )
+
+            except requests.exceptions.RequestException as exc:
+                logger.warning(
+                    "Telegram network error (attempt %d/%d) — %.1fs back-off: %s",
+                    attempt, self._MAX_RETRIES, backoff, exc,
+                )
+            except Exception as exc:
+                logger.error("Telegram send error: %s", exc)
+
+            if attempt < self._MAX_RETRIES:
+                time.sleep(backoff + jitter())
+                backoff = min(backoff * 2.0, self._MAX_BACKOFF_S)
+
+        logger.error("Telegram send FAILED after %d attempts.", self._MAX_RETRIES)
+        self.fail_count += 1
+        return False
+
+    # ------------------------------------------------------------------
+    def send_scan_summary(
+        self,
+        ranked_proposals: list,
+        total_scanned  : int   = 0,
+        market_regime  : Dict[str, Any] | None = None,
+        top_n          : int   = 10,
+        send_empty     : bool  = False,
+    ) -> Tuple[int, int]:
+        """Send a complete scan report: header + top-N opportunities + footer.
+
+        Parameters
+        ----------
+        ranked_proposals:
+            Sorted list of proposals (InvestmentProposal-like objects).
+        total_scanned:
+            Size of the full universe that was scanned.
+        market_regime:
+            Dict with keys ``_overall``, ``_score``, ``_bias``.
+        top_n:
+            How many opportunities to send.
+        send_empty:
+            If True, send a "no results" notice when the list is empty.
+
+        Returns
+        -------
+        ``(ok_count, fail_count)`` — per-segment delivery counts.
+        """
+        ok_n   = 0
+        fail_n = 0
+
+        if not ranked_proposals:
+            if send_empty:
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                if self.send(
+                    f"📭 <b>Scan complete — no qualifying opportunities</b>\n"
+                    f"🕐 {ts}\n"
+                    f"All {total_scanned} symbols below confidence floor."
+                ): ok_n += 1
+                else: fail_n += 1
+            return ok_n, fail_n
+
+        # ── Category mix ─────────────────────────────────────────────
+        mix: Dict[str, int] = {}
+        for p in ranked_proposals[:top_n]:
+            key = f"{getattr(p,'_cap_tier','?')}/{getattr(p,'_opp_type','?')}"
+            mix[key] = mix.get(key, 0) + 1
+
+        # ── Header ──────────────────────────────────────────────────
+        if self.send_header(
+            market_regime or {
+                "_overall": "RUN",
+                "_score"  : 0,
+                "_bias"   : {"direction": "—"},
+            },
+            total_scanned=total_scanned,
+            top10_mix=mix,
+            top_n=top_n,
+        ): ok_n += 1
+        else: fail_n += 1
+
+        # ── Opportunities ───────────────────────────────────────────
+        for rank, p in enumerate(ranked_proposals[:top_n], 1):
+            if self.send_opportunity(rank, p, top_n=top_n): ok_n += 1
+            else: fail_n += 1
+
+        # ── Footer ──────────────────────────────────────────────────
+        if self.send_footer(min(top_n, len(ranked_proposals))): ok_n += 1
+        else: fail_n += 1
+
+        return ok_n, fail_n
+
 
     # ------------------------------------------------------------------
     def send_opportunity(self, rank: int, proposal: Any, top_n: int = 10) -> bool:
@@ -278,7 +522,7 @@ class TelegramNotifier:
 # ---------------------------------------------------------------------------
 
 _UNIVERSE_CATALOG: Dict[str, Dict[str, str]] = {
-    # ── MEGA TECHNOLOGY ($300B+) ──────────────────────────────────────────────
+    # ── MEGA / LARGE CAP ────────────────────────────────────────────────────────
     "AAPL":{"opp":"MOMENTUM","cap":"MEGA","sector":"Technology"},
     "MSFT":{"opp":"GROWTH","cap":"MEGA","sector":"Technology"},
     "NVDA":{"opp":"BREAKOUT","cap":"MEGA","sector":"Semiconductors"},
@@ -303,7 +547,6 @@ _UNIVERSE_CATALOG: Dict[str, Dict[str, str]] = {
     "SNOW":{"opp":"GROWTH","cap":"LARGE","sector":"Technology"},
     "ARM":{"opp":"GROWTH","cap":"LARGE","sector":"Semiconductors"},
     "MSTR":{"opp":"BREAKOUT","cap":"LARGE","sector":"Financials"},
-    "COIN":{"opp":"BREAKOUT","cap":"LARGE","sector":"Financials"},
     "JPM":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
     "BAC":{"opp":"VALUE","cap":"LARGE","sector":"Financials"},
     "WFC":{"opp":"TURNAROUND","cap":"LARGE","sector":"Financials"},
@@ -341,7 +584,7 @@ _UNIVERSE_CATALOG: Dict[str, Dict[str, str]] = {
     "HD":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Disc."},
     "LOW":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Disc."},
     "TGT":{"opp":"TURNAROUND","cap":"LARGE","sector":"Consumer Disc."},
-    "SBUX":{"opp":"TURNAROUND","cap":"MID","sector":"Consumer Disc."},
+    "SBUX":{"opp":"TURNAROUND","cap":"LARGE","sector":"Consumer Disc."},
     "CMG":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Disc."},
     "CAT":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
     "DE":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
@@ -393,9 +636,7 @@ _UNIVERSE_CATALOG: Dict[str, Dict[str, str]] = {
     "LULU":{"opp":"BREAKOUT","cap":"LARGE","sector":"Consumer Disc."},
     "OXY":{"opp":"MOMENTUM","cap":"LARGE","sector":"Energy"},
     "SMCI":{"opp":"BREAKOUT","cap":"MID","sector":"Technology"},
-    "LLY1":{"opp":"BREAKOUT","cap":"MID","sector":"Healthcare"},
     "BMRN":{"opp":"BREAKOUT","cap":"LARGE","sector":"Healthcare"},
-    "VRTX1":{"opp":"BREAKOUT","cap":"LARGE","sector":"Healthcare"},
     "SYK":{"opp":"MOMENTUM","cap":"LARGE","sector":"Healthcare"},
     "CATY":{"opp":"MOMENTUM","cap":"MID","sector":"Financials"},
     "FITB":{"opp":"VALUE","cap":"LARGE","sector":"Financials"},
@@ -407,14 +648,10 @@ _UNIVERSE_CATALOG: Dict[str, Dict[str, str]] = {
     "ICE":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
     "CME":{"opp":"MOMENTUM","cap":"LARGE","sector":"Financials"},
     "MDB":{"opp":"BREAKOUT","cap":"MID","sector":"Technology"},
-    "MSTR":{"opp":"BREAKOUT","cap":"LARGE","sector":"Financials"},
     "DOCU":{"opp":"TURNAROUND","cap":"LARGE","sector":"Technology"},
     "TEAM":{"opp":"TURNAROUND","cap":"MID","sector":"Technology"},
     "ZM":{"opp":"TURNAROUND","cap":"LARGE","sector":"Technology"},
     "SQ":{"opp":"TURNAROUND","cap":"LARGE","sector":"Technology"},
-    "PYPL":{"opp":"TURNAROUND","cap":"LARGE","sector":"Financials"},
-    "COST":{"opp":"MOMENTUM","cap":"LARGE","sector":"Consumer Staples"},
-    "TXN":{"opp":"MOMENTUM","cap":"LARGE","sector":"Semiconductors"},
     "WMB":{"opp":"GROWTH","cap":"LARGE","sector":"Energy"},
     "FDX":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
     "FAST":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
@@ -422,6 +659,10 @@ _UNIVERSE_CATALOG: Dict[str, Dict[str, str]] = {
     "EFX":{"opp":"MOMENTUM","cap":"LARGE","sector":"Technology"},
     "CTAS":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
     "ODFL":{"opp":"MOMENTUM","cap":"LARGE","sector":"Industrials"},
+    # Legacy-style extra entries (kept for backward compat, not used in dict.update)
+    "COIN":{"opp":"BREAKOUT","cap":"LARGE","sector":"Financials"},
+    "LLY1":{"opp":"BREAKOUT","cap":"MID","sector":"Healthcare"},
+    "VRTX1":{"opp":"BREAKOUT","cap":"LARGE","sector":"Healthcare"},
 }
 
 # Canonical, deduplicated, ordered scan list
@@ -432,17 +673,6 @@ _CAP_TIER_WEIGHT: Dict[str, float] = {"MEGA":1.0,"LARGE":2.0,"MID":5.0,"SMALL":9
 _OPP_BOOST:       Dict[str, float] = {
     "BREAKOUT":12.0,"MOMENTUM":9.0,"GROWTH":7.0,"VALUE":4.0,"TURNAROUND":6.0,
 }
-
-# Shared scan constants
-_SCAN_WORKERS:       int = 8
-_SCAN_TIMEOUT_S:     int = 30
-_MIN_CONFIDENCE:     float = 48.0
-
-# Auto-scan state
-_LAST_SCAN_AT:   Optional[datetime] = None
-_AUTO_SCAN_LOCK = threading.Lock()          # prevents overlapping runs
-_auto_scan_log:  List[str] = []             # bounded circular buffer of log lines
-
 
 # ---------------------------------------------------------------------------
 # Reusable scan runner + Telegram dispatcher (called by Streamlit toggle AND
@@ -478,38 +708,66 @@ def _run_scan_job(
 
         if not ranked:
             if send_empty:
-                notifier.send(
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                if not notifier.send(
                     f"📭 <b>Scan complete — no qualifying opportunities</b>\n"
-                    f"🕐 {ts_start.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                    f"🕐 {ts}\n"
                     f"All {len(scanner.universe)} symbols below confidence floor."
-                )
+                ):
+                    notifier.fail_count += 1
             logger.info("No proposals. Silent skip (send_empty=%s).", send_empty)
             return
 
-        # Category mix for header
+# ── Filter for BUY / STRONG BUY only ───────────────────────────────
+        filtered_ranked = []
+        for p in (ranked or []):
+            ac = getattr(p, "analyst_consensus", None)
+            ac_label = ac.get("label", "") if ac else ""
+            if ac_label in ("STRONG BUY", "BUY"):
+                filtered_ranked.append(p)
+            elif ac_label:
+                logger.debug(f"_run_scan_job: Filtered out {getattr(p, 'symbol', '?')} - analyst label: {ac_label}")
+
+        logger.info(f"_run_scan_job: Buy-filter: {len(filtered_ranked)}/{len(ranked) if ranked else 0} with BUY/STRONG BUY consensus")
+
+        if not filtered_ranked:
+            logger.info("_run_scan_job: No BUY/STRONG BUY stocks found.")
+            if not send_empty:
+                return
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            notifier.send(
+                f"📭 <b>Scan complete — no BUY/STRONG BUY opportunities</b>\n"
+                f"🕐 {ts}"
+            )
+            return
+
+        # Category mix for header (use filtered proposals)
         mix: Dict[str, int] = {}
-        for p in ranked[:top_n]:
+        for p in filtered_ranked[:top_n]:
             key = f"{getattr(p,'_cap_tier','?')}/{getattr(p,'_opp_type','?')}"
             mix[key] = mix.get(key, 0) + 1
 
-        # Header → each opportunity → footer
-        notifier.send_header(
-            {"_overall":"RUN","_score":0,"_bias":{"direction":"—"}},
-            total_scanned=len(scanner.universe),
-            top10_mix=mix,
+        ok_n, fail_n = notifier.send_scan_summary(
+            ranked_proposals=filtered_ranked,
+            total_scanned  =len(scanner.universe),
+            market_regime  ={
+                "_overall": "RUN",
+                "_score"  : 0,
+                "_bias"   : {"direction": "—"},
+            },
             top_n=top_n,
         )
-        for rank, p in enumerate(ranked[:top_n], 1):
-            notifier.send_opportunity(rank, p, top_n=top_n)
-            time.sleep(0.4)  # Telegram rate-limit friendly
-        notifier.send_footer(min(top_n, len(ranked)))
+
+        global _TG_SENT_TOTAL, _TG_FAIL_TOTAL
+        _TG_SENT_TOTAL += ok_n
+        _TG_FAIL_TOTAL += fail_n
 
         logger.info(
-            "Telegram batch sent — %d proposals, %d shared.",
-            len(ranked[:top_n]), len(mix),
+            "Telegram batch sent — %d/%d msgs delivered (%d failed).",
+            ok_n, ok_n + fail_n, fail_n,
         )
         _auto_scan_log.append(
-            f"[{ts_start.strftime('%H:%M:%S')}] Sent {min(top_n,len(ranked))} / {len(ranked)}"
+            f"[{ts_start.strftime('%H:%M:%S')}] Delivered {ok_n}/{ok_n+fail_n} msgs"
         )
     except Exception:
         logger.exception("scan_job crashed")
@@ -807,13 +1065,11 @@ def _download_timeframe(
         # `repair=True` can raise KeyError('Stock Splits') on some 1wk payloads.
         # Keep repair only for daily bars where it is most useful.
         use_repair = interval in {"1d", "1h", "1m"}
-        df = yf.download(
-            tickers=symbol,
+        df = safe_yf_download(
+            symbol,
             period=period,
             interval=interval,
-            progress=False,
             auto_adjust=True,
-            threads=False,
             prepost=False,
             repair=use_repair,
         )
@@ -2404,9 +2660,778 @@ class BreakoutEngine:
 
 
 # ===============================================
-# 6. TECHNICAL ENGINE (ENHANCED)
+# 5. VOLUME PROFILE, VWAP-ENHANCED & ICHIMOKU CLOUD
 # ===============================================
 
+class VolumeProfileAnalyzer:
+    """
+    Volume Profile — institutional-grade volume distribution analysis.
+
+    Derived from the same OHLCV bars as every other engine, so no new
+    data source is required.
+
+    Key outputs
+    -----------
+    poc           :   Point of Control (highest-volume price level)
+    value_area    :   (low, high) enclosing ~70 % of total volume
+    low_vol_nodes :   Price zones below 10th-percentile volume density
+    high_vol_nodes:   Price zones above 90th-percentile volume density
+    distribution  :   "ABSORBING" | "BALANCED" | "SKEWED"
+    """
+
+    @staticmethod
+    def analyze(
+        df: pd.DataFrame,
+        bins: int = 80,
+        value_area_pct: float = 0.70,
+    ) -> Dict[str, Any]:
+
+        df = normalize_ohlcv(df)
+
+        if df is None or len(df) < 30:
+
+            return {"status": "NO_DATA"}
+
+        try:
+
+            close  = df["close"].astype(float)
+            volume = df["volume"].astype(float).clip(lower=0.0)
+
+            # Price range for the histogram
+            lo = float(close.min())
+            hi = float(close.max())
+
+            if hi <= lo:
+
+                hi = lo * 1.01  # avoid degenerate range
+
+            edges = np.linspace(lo, hi, bins + 1)
+
+            hist, _ = np.histogram(close, bins=edges, weights=volume)
+
+            centres = 0.5 * (edges[:-1] + edges[1:])
+
+            total_vol = float(hist.sum())
+
+            if total_vol <= 0:
+
+                return {"status": "NO_DATA"}
+
+            # --- Point of Control ---
+            poc_idx  = int(np.argmax(hist))
+            poc      = float(centres[poc_idx])
+            poc_vol  = float(hist[poc_idx])
+
+            # --- Value area (70 % by mass) ---
+            sorted_idx   = np.argsort(-hist)
+            cum_pct      = np.cumsum(hist[sorted_idx]) / total_vol
+
+            va_mask = cum_pct <= value_area_pct
+
+            # Always include at least one bin on each side
+            va_mask[0]  = True
+            va_mask[-1] = True
+
+            va_bins     = sorted_idx[va_mask]
+
+            va_low  = float(centres[sorted_idx[va_bins].min()])
+            va_high = float(centres[sorted_idx[va_bins].max()])
+
+            va_vol_pct = round(100.0 * float(hist[va_bins].sum()) / total_vol, 1)
+
+            # --- Low / high volume nodes ---
+            vol_percentiles = np.percentile(hist[hist > 0], [10, 90])
+
+            lvn_mask = hist <= vol_percentiles[0]
+            hvn_mask = hist >= vol_percentiles[1]
+
+            low_vn  = [round(float(c), 4) for c in centres[lvn_mask]]
+            high_vn = [round(float(c), 4) for c in centres[hvn_mask]]
+
+            # --- Distribution character ---
+            poc_mid = (va_low + va_high) / 2.0
+
+            skew    = (poc - poc_mid) / max(abs(va_high - va_low), 1e-9)
+
+            if abs(skew) < 0.15:
+
+                distribution = "BALANCED"
+
+            elif skew < -0.15:
+
+                distribution = "SKEWED_ABOVE"
+
+            else:
+
+                distribution = "SKEWED_BELOW"
+
+            # --- Absorbing profile check ---
+            # When POC is near the middle and VA width < 20 % of range
+            va_width_pct = (va_high - va_low) / max(abs(hi - lo), 1e-9) * 100
+
+            profile_type = "ABSORBING" if (va_width_pct < 25 and abs(skew) < 0.2) \
+                       else "BALANCED"   if va_width_pct < 50 \
+                       else "DISTRIBUTED"
+
+            # --- Current price vs POC ---
+            last = float(close.iloc[-1])
+
+            dist_from_poc = round((last - poc) / max(abs(poc), 1e-9) * 100, 2)
+
+            in_va = va_low <= last <= va_high
+
+            poc_tag = (
+                "ABOVE_POC"  if last > poc + (va_high - va_low) * 0.25
+                else "BELOW_POC" if last < poc - (va_high - va_low) * 0.25
+                else "AT_POC"
+            )
+
+            return {
+                "status"           : "OK",
+                "poc"              : round(poc, 4),
+                "poc_volume_share" : round(100.0 * poc_vol / total_vol, 2),
+                "value_area_low"   : round(va_low, 4),
+                "value_area_high"  : round(va_high, 4),
+                "value_area_vol_pct": va_vol_pct,
+                "low_vol_nodes"    : sorted(low_vn),
+                "high_vol_nodes"   : sorted(high_vn),
+                "distribution"     : distribution,
+                "profile_type"     : profile_type,
+                "price_in_va"      : in_va,
+                "last_price"       : last,
+                "dist_from_poc_pct": dist_from_poc,
+                "poc_tag"          : poc_tag,
+            }
+
+        except Exception as e:
+
+            logger.debug("VolumeProfileAnalyzer: %s", e)
+
+            return {"status": "ERROR", "error": str(e)}
+
+
+def _compute_vwap_bands(
+    df: pd.DataFrame,
+    std_devs: Tuple[float, float, float] = (1.0, 2.0, 3.0),
+) -> Dict[str, Any]:
+    """
+    Session / daily VWAP with symmetrical standard-deviation bands.
+
+    Returns:
+        vwap       – VWAP centre line
+        band_lo[i], band_hi[i] – lower / upper band for each std_dev in std_devs
+        band_tag   – price position relative to bands
+        vwap_slope – trend direction of VWAP (positive = rising = bullish context)
+    """
+    df = normalize_ohlcv(df)
+
+    if df is None or len(df) < 20:
+
+        return {}
+
+    try:
+
+        tp  = (df["high"] + df["low"] + df["close"]) / 3.0
+        v   = df["volume"].astype(float).clip(lower=0.0)
+
+        vwap  = (tp * v).cumsum() / (v.cumsum() + 1e-12)
+        vsq   = v * (tp - vwap) ** 2
+        var   = vsq.cumsum() / (v.cumsum() + 1e-12)
+
+        std   = var.pow(0.5)
+        last  = float(df["close"].iloc[-1])
+        vw    = float(vwap.iloc[-1])
+
+        out = {
+            "vwap" : round(vw, 4),
+            "close": last,
+        }
+
+        for i, sd in enumerate(std_devs):
+
+            lo = round(float(vwap.iloc[-1] - sd * std.iloc[-1]), 4)
+            hi = round(float(vwap.iloc[-1] + sd * std.iloc[-1]), 4)
+
+            out[f"band_lo_{int(sd)}sd"] = lo
+            out[f"band_hi_{int(sd)}sd"] = hi
+
+        # Price tag vs VWAP + its ±1-sd band
+        if last < out.get("band_lo_1sd", lo):
+
+            out["vwap_tag"] = "DEEP_BELOW"
+
+        elif last > out.get("band_hi_1sd", hi):
+
+            out["vwap_tag"] = "DEEP_ABOVE"
+
+        elif last < vw:
+
+            out["vwap_tag"] = "BELOW_VWAP"
+
+        elif last > vw:
+
+            out["vwap_tag"] = "ABOVE_VWAP"
+
+        else:
+
+            out["vwap_tag"] = "AT_VWAP"
+
+        # VWAP slope (simple 5-bar momentum proxy)
+        if len(vwap) >= 6:
+
+            slope = vwap.iloc[-1] - vwap.iloc[-6]
+
+            out["vwap_slope"] = round(float(slope), 4)
+
+            out["vwap_slope_pct"] = round(
+                float(slope) / max(abs(vwap.iloc[-6]), 1e-12) * 100,
+                4,
+            )
+
+        else:
+
+            out["vwap_slope"] = 0.0
+            out["vwap_slope_pct"] = 0.0
+
+        out["vwap_distance_pct"] = round(
+            (last - vw) / max(abs(vw), 1e-12) * 100,
+            4,
+        )
+
+        return out
+
+    except Exception as e:
+
+        logger.debug("VWAP bands: %s", e)
+
+        return {}
+
+
+class IchimokuAnalyzer:
+    """
+    Ichimoku Kinko Hyo — five lines, one consensus cloud.
+
+    1. Tenkan-sen  (9-bar)  — conversion / trigger line
+    2. Kijun-sen  (26-bar) — base / confirmation line
+    3. Senkou-A   (span A) — leading span A = mid(Tenkan, Kijun) shifted +26
+    4. Senkou-B   (span B) — leading span B = mid(52-bar high, low) shifted +26
+    5. Chikou     (lag)    — close shifted −26
+
+    Signals
+    -------
+    BULLISH when:
+        Price  > Cloud (Senkou-A > Senkou-B, bullish cloud)
+        Tenkan > Kijun
+        Chikou > price 26 bars ago
+    BEARISH when:
+        Price  < Cloud (Senkou-A < Senkou-B, bearish cloud)
+        Tenkan < Kijun
+        Chikou < price 26 bars ago
+    """
+
+    @staticmethod
+    def analyze(df: pd.DataFrame) -> Dict[str, Any]:
+
+        df = normalize_ohlcv(df)
+
+        if df is None or len(df) < 60:
+
+            return {"status": "NO_DATA"}
+
+        try:
+
+            high  = df["high"].astype(float)
+            low   = df["low"].astype(float)
+            close = df["close"].astype(float)
+
+            tenkan = (high.rolling(9).max() + low.rolling(9).min()) / 2.0
+            kijun  = (high.rolling(26).max() + low.rolling(26).min()) / 2.0
+
+            span_a_raw = (tenkan + kijun) / 2.0          # current; actual plot shifted +26
+            span_b_raw = (high.rolling(52).max() + low.rolling(52).min()) / 2.0
+
+            # Current cloud top and bottom (Senkou A vs B determines cloud colour)
+            cloud_top   = pd.concat([span_a_raw, span_b_raw], axis=1).max(axis=1)
+            cloud_bot   = pd.concat([span_a_raw, span_b_raw], axis=1).min(axis=1)
+
+            # Chikou (lagging span): close shifted 26 bars back
+            chikou = close.shift(-26)
+
+            # --- latest values ---
+            last_idx    = -1
+            price       = float(close.iloc[last_idx])
+            t_cur       = float(tenkan.iloc[last_idx])
+            k_cur       = float(kijun.iloc[last_idx])
+            sa_cur      = float(span_a_raw.iloc[last_idx])
+            sb_cur      = float(span_b_raw.iloc[last_idx])
+            chk_cur     = float(chikou.iloc[last_idx])
+            ct_cur      = float(cloud_top.iloc[last_idx])
+            cb_cur      = float(cloud_bot.iloc[last_idx])
+
+            # --- Cloud colour ---
+            cloud_bullish = sa_cur > sb_cur
+
+            # --- Price vs Cloud ---
+            above_cloud = price >= ct_cur
+            below_cloud = price <= cb_cur
+
+            # --- Tenkan / Kijun cross ---
+            tk_bullish_cross = t_cur > k_cur
+            tk_bearish_cross = t_cur < k_cur
+
+            # --- Chikou confirmation ---
+            price_26_ago = close.iloc[-27] if len(close) >= 27 else float("nan")
+            chikou_bullish = chk_cur > price_26_ago
+            chikou_bearish = chk_cur < price_26_ago
+
+            # --- Score: 4 criteria → 0–100 ---
+            score = 50
+            if above_cloud:
+                score += 12
+            if below_cloud:
+                score -= 12
+            if cloud_bullish and above_cloud:
+                score += 6
+            if not cloud_bullish and below_cloud:
+                score -= 6
+            if tk_bullish_cross:
+                score += 8
+            if tk_bearish_cross:
+                score -= 8
+            if chikou_bullish:
+                score += 6
+            if chikou_bearish:
+                score -= 6
+
+            score = float(np.clip(score, 0, 100))
+
+            # --- Label ---
+            if score >= 70:
+
+                label = "STRONG_BULL"
+
+            elif score >= 55:
+
+                label = "BULLISH"
+
+            elif score <= 30:
+
+                label = "BEARISH"
+
+            elif score <= 45:
+
+                label = "WEAK_BEAR"
+
+            else:
+
+                label = "NEUTRAL"
+
+            return {
+                "status"       : "OK",
+                "score"        : round(score, 1),
+                "label"        : label,
+                "above_cloud"  : bool(above_cloud),
+                "below_cloud"  : bool(below_cloud),
+                "cloud_bullish": bool(cloud_bullish),
+                "cloud_colour" : "GREEN" if cloud_bullish else "RED",
+                "tk_bullish"   : bool(tk_bullish_cross),
+                "chikou_bullish": bool(chikou_bullish),
+                "tenkan_sen"   : round(t_cur, 4),
+                "kijun_sen"    : round(k_cur, 4),
+                "senkou_a"     : round(sa_cur, 4),
+                "senkou_b"     : round(sb_cur, 4),
+                "cloud_top"    : round(ct_cur, 4),
+                "cloud_bottom" : round(cb_cur, 4),
+            }
+
+        except Exception as e:
+
+            logger.debug("IchimokuAnalyzer: %s", e)
+
+            return {"status": "ERROR", "error": str(e)}
+
+
+# ===============================================
+# 5b. EARNINGS / EVENT CALENDAR RISK FILTER
+# ===============================================
+
+_EVENT_FILTER_KEYWORDS: Tuple[str, ...] = (
+    "earnings", "eps report", "earnings call",
+    "fda ruling", "fda decision", "pdufa",
+    "product launch", "merger", "acquisition",
+    "spin-off", "bankruptcy", "sec investigation",
+    "fed meeting", "rate decision", "fomc",
+)
+
+# Earned earnings-risk keywords (proven to cause gap risk)
+_EVENT_SEVERITY: Dict[str, int] = {
+    "earnings"          : 30,
+    "fda decision"      : 40,
+    "pdufa"             : 35,
+    "product launch"    : 15,
+    "merger"            : 20,
+    "acquisition"       : 20,
+    "spin-off"          : 15,
+    "bankruptcy"        : 50,
+    "sec investigation" : 25,
+    "fed meeting"       : 12,
+    "rate decision"     : 12,
+}
+
+
+class EarningsCalendarEngine:
+    """
+    Lightweight catalyst-risk engine built on Yahoo Finance news headlines
+    attached to the ticker.  No paid API is required.
+
+    For every symbol it fetches the last 8 headlines, scans for known
+    high-impact event keywords, and returns a single ``risk_score`` (0–100)
+    that can be used to halve or block a position.
+    """
+
+    _CACHE: Dict[str, Dict[str, Any]] = {}
+    _CACHE_TTL_S: int = 1800   # 30 min
+
+    @classmethod
+    @staticmethod
+    def assess(
+        symbol: str,
+        *,
+        ttl: int = _CACHE_TTL_S,
+    ) -> Dict[str, Any]:
+
+        import time as _time
+
+        now = _time.time()
+
+        cached = EarningsCalendarEngine._CACHE.get(symbol)
+
+        if cached and (now - cached["ts"]) < ttl:
+
+            return cached["data"]
+
+        try:
+
+            ticker   = yf.Ticker(symbol)
+            news_raw = ticker.news or []
+
+            risk_score = 0
+            flags: List[str] = []
+            days_ahead = 14  # Conservative look-ahead window
+
+            for item in news_raw[:10]:
+
+                title = (item.get("title") or "").lower()
+                publisher = (item.get("publisher") or "").lower()
+
+                # Calculate how "soon" this news item is
+                pub_ts  = item.get("providerPublishTime", 0)
+                age_days = max(0, (now - pub_ts) / 86400.0) if pub_ts else 999
+
+                for kw, sev in _EVENT_SEVERITY.items():
+
+                    if kw in title:
+
+                        # Attenuate by proximity: full weight at day 0, zero at day 14
+                        proximity = max(0.0, 1.0 - age_days / max(days_ahead, 1))
+
+                        risk_score = min(100, risk_score + int(sev * proximity))
+
+                        flags.append(f"{kw} (+{int(sev * proximity)})")
+
+                        break  # one event per headline
+
+            risk_score = float(np.clip(risk_score, 0, 100))
+
+            if risk_score >= 50:
+
+                label = "HIGH"
+
+            elif risk_score >= 25:
+
+                label = "MEDIUM"
+
+            else:
+
+                label = "LOW"
+
+            result: Dict[str, Any] = {
+                "risk_score"    : round(risk_score, 1),
+                "label"         : label,
+                "flags"         : flags,
+                "position_advice": "AVOID_NEW"        if risk_score >= 50
+                             else "REDUCE_SIZE"     if risk_score >= 35
+                             else "HALVE_SIZE"      if risk_score >= 25
+                             else "STANDARD",
+                "raw_headlines" : 0 if not news_raw else len(news_raw),
+            }
+
+            EarningsCalendarEngine._CACHE[symbol] = {
+
+                "data": result,
+                "ts"  : now,
+
+            }
+
+            return result
+
+        except Exception as e:
+
+            logger.debug("EarningsCalendarEngine %s: %s", symbol, e)
+
+            return {
+
+                "risk_score"     : 0.0,
+                "label"          : "LOW",
+                "flags"          : [],
+                "position_advice": "STANDARD",
+                "raw_headlines"  : 0,
+
+            }
+
+
+# ===============================================
+# 5c. CORRELATION & PORTFOLIO EXPOSURE ENGINE
+# ===============================================
+
+class CorrelationMatrixEngine:
+    """
+    Builds a rolling daily-return correlation matrix for all active
+    proposal symbols so that no single sector / factor cluster
+    dominates the portfolio.
+
+    Maximum per-sector Net exposure: 20 %
+    Maximum pairwise correlation penalty for co-linear pairs.
+    """
+
+    ALLOCATION_LIMITS: Dict[str, float] = {
+
+        # Asset-class fat-finger guards
+        "HighCorrCluster" : 0.22,
+
+        "Energy"          : 0.20,
+        "Utilities"       : 0.15,
+
+        "Technology"      : 0.25,
+        "Semiconductors"  : 0.20,
+
+        "Financials"      : 0.20,
+        "Healthcare"      : 0.20,
+
+        "Consumer Disc."  : 0.18,
+        "Consumer Staples": 0.15,
+
+        "Industrials"     : 0.20,
+        "Materials"       : 0.15,
+        "Real Estate"     : 0.12,
+        "Comm. Services"  : 0.20,
+
+        # Crypto / FX not heavily weighted in this model
+        "DEFAULT"         : 0.20,
+    }
+
+    # Hard cap in % of portfolio equity
+    MAX_SECTOR_NET: float = 0.25
+    MAX_CORR_PAIR_PENALTY: float = 0.35
+
+    _cache_history: Dict[str, pd.Series] = {}
+
+    @classmethod
+    def _get_returns(cls, symbol: str, period: str = "3mo") -> Optional[pd.Series]:
+
+        cached = cls._cache_history.get(symbol)
+
+        if cached is not None:
+
+            return cached
+
+        try:
+
+            df = _yf_call(
+                yf.download,
+                symbol,
+                period=period,
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+
+            df = normalize_ohlcv(df)
+
+            if df is None or len(df) < 30:
+
+                return None
+
+            rets = df["close"].pct_change().dropna()
+
+            cls._cache_history[symbol] = rets
+
+            return rets
+
+        except Exception:
+
+            return None
+
+    @classmethod
+    def compute_exposure_adjustment(
+        cls,
+        proposals: List[Any],
+    ) -> Dict[str, Any]:
+        """
+        Given a list of active ``InvestmentProposal``-like objects,
+        return adjusted position-size % for each.
+
+        Returns
+        -------
+        Dict with:
+            adjustments : {symbol: multiplier 0.0–1.0}
+            new_sizes   : {symbol: adjusted_pct}
+            warnings    : [explanation strings …]
+        """
+        if not proposals:
+
+            return {"adjustments": {}, "new_sizes": {}, "warnings": []}
+
+        # --- Get sector for each symbol ---
+        sym_sector: Dict[str, str] = {}
+        for p in proposals:
+
+            sym  = getattr(p, "symbol", "") or ""
+            sec  = getattr(p, "sector_exposure", "") or ""
+
+            if not sec:
+
+                raw = getattr(p, "sector_flow", None) or {}
+
+                sf = raw if isinstance(raw, dict) else {}
+
+                sec  = sf.get("sector_name", "DEFAULT") or "DEFAULT"
+
+            sym_sector[sym] = sec
+
+        # --- Build returns table ---
+        symbols = [sym for sym in sym_sector]
+        ret_map: Dict[str, Optional[pd.Series]] = {}
+
+        for sym in symbols:
+
+            ret_map[sym] = cls._get_returns(sym)
+
+        common = min(
+            (len(r) for r in ret_map.values() if r is not None),
+            default=0,
+        )
+
+        if common < 20:
+
+            return {
+                "adjustments": {s: 1.0 for s in symbols},
+                "new_sizes"  : {s: None    for s in symbols},
+                "warnings"   : [f"Insufficient history ({common}d)"],
+            }
+
+        # Trim to common index
+        aligned = {
+            s: r.iloc[-common:]
+            for s, r in ret_map.items()
+            if r is not None and len(r) >= common
+        }
+
+        labels = list(aligned)
+
+        mat = pd.DataFrame(aligned).dropna()
+
+        if mat.shape[1] < 2:
+
+            return {
+
+                "adjustments": {s: 1.0 for s in symbols},
+                "new_sizes"  : {s: None    for s in symbols},
+                "warnings"   : ["< 2 symbols with aligned returns"],
+
+            }
+
+        corr = mat.corr()
+
+        # --- Aggregate per-sector exposure ---
+        sector_exp: Dict[str, float] = {}
+        for p in proposals:
+
+            sym  = getattr(p, "symbol", "") or ""
+            orig = float(getattr(p, "position_size_pct", 0) or 0)
+
+            sec  = sym_sector.get(sym, "DEFAULT")
+
+            sector_exp[sec] = sector_exp.get(sec, 0.0) + orig
+
+        adj: Dict[str, float]       = {}
+        new_sizes: Dict[str, float] = {}
+        warnings: List[str]         = []
+
+        for p in proposals:
+
+            sym  = getattr(p, "symbol", "") or ""
+
+            sec  = sym_sector.get(sym, "DEFAULT")
+
+            orig = float(getattr(p, "position_size_pct", 0) or 0)
+
+            multiplier = 1.0
+
+            # --- Sector cap ---
+            limit = float(cls.ALLOCATION_LIMITS.get(
+                sec,
+                cls.ALLOCATION_LIMITS["DEFAULT"],
+            ))
+
+            if sector_exp.get(sec, 0) > limit * 100:
+
+                excess = sector_exp[sec] - limit * 100
+                
+                multiplier *= max(0.3, 1.0 - excess / max(limit * 100, 1))
+
+                warnings.append(
+                    f"{sym} ({sec}): cluster limit {limit*100:.0f}% → {orig:.1f}% → {orig*multiplier:.1f}%"
+                )
+
+            # --- Pairwise correlation penalty (only if in top-N with highest correlations) ---
+            if sym in corr.index:
+
+                high_corr = corr.loc[sym].drop(sym, errors="ignore").abs()
+
+                if not high_corr.empty:
+
+                    max_corr_peer = high_corr.idxmax()
+                    max_corr_val  = float(high_corr.max())
+
+                    if max_corr_val > 0.75:
+
+                        corr_pen = 1.0 - cls.MAX_CORR_PAIR_PENALTY
+
+                        multiplier *= corr_pen
+
+                        warnings.append(
+                            f"{sym} ↔ {max_corr_peer}: r={max_corr_val:.2f} → size "
+                            f"{orig:.1f}% × {corr_pen:.2f}"
+                        )
+
+            multiplier = float(np.clip(multiplier, 0.2, 1.0))
+
+            adj[sym]    = round(multiplier, 3)
+            new_sizes[sym] = round(orig * multiplier, 2)
+
+        return {
+
+            "adjustments" : adj,
+            "new_sizes"   : new_sizes,
+            "warnings"    : warnings,
+
+        }
+
+# ===============================================
+# 6. TECHNICAL ENGINE (ENHANCED)
+# ===============================================
 class TechnicalEngine:
     @staticmethod
     def get_indicators(df: pd.DataFrame) -> dict:
@@ -2518,6 +3543,41 @@ class TechnicalEngine:
         roc_20 = (close.iloc[-1] / close.iloc[-21] - 1) * 100 if len(close) > 21 else 0
         roc_50 = (close.iloc[-1] / close.iloc[-51] - 1) * 100 if len(close) > 51 else 0
 
+        # --- Volume Profile ---
+        vp = VolumeProfileAnalyzer.analyze(df)
+
+        poc_tag        = vp.get("poc_tag", "UNKNOWN")
+        va_low_poc     = vp.get("value_area_low")
+        va_high_poc    = vp.get("value_area_high")
+        poc_pct        = vp.get("poc_volume_share", 0)
+        distribution   = vp.get("distribution", "UNKNOWN")
+        profile_type   = vp.get("profile_type", "UNKNOWN")
+        price_in_va    = vp.get("price_in_va", False)
+
+        # --- VWAP + Standard-Deviation Bands ---
+        vwap_data = _compute_vwap_bands(df)
+
+        vwap_val    = vwap_data.get("vwap", 0.0)
+        vwap_tag    = vwap_data.get("vwap_tag", "UNKNOWN")
+        vwap_slope  = vwap_data.get("vwap_slope_pct", 0.0)
+        vwap_dist   = vwap_data.get("vwap_distance_pct", 0.0)
+        above_1sd   = vwap_data.get("band_hi_1sd", 0)
+        below_1sd   = vwap_data.get("band_lo_1sd", 0)
+
+        # --- Ichimoku Cloud ---
+        ichi = IchimokuAnalyzer.analyze(df) if len(df) >= 60 else {"status": "NO_DATA"}
+
+        ichi_score  = ichi.get("score", 50)
+        ichi_label  = ichi.get("label", "NEUTRAL")
+        cloud_colour= ichi.get("cloud_colour", "NEUTRAL")
+
+        # --- Earnings / Event Risk ---
+        evt = EarningsCalendarEngine.assess(getattr(df, "name", "") or "")
+
+        event_risk = evt.get("risk_score", 0.0)
+        event_label= evt.get("label", "LOW")
+        event_advice= evt.get("position_advice", "STANDARD")
+
         return {
             "ema_trend": ema_trend,
             "ma_confluence": ma_confluence,
@@ -2539,7 +3599,30 @@ class TechnicalEngine:
             "roc_50d": round(float(roc_50), 2),
             "close": float(close.iloc[-1]),
             "above_sma200": sma200 is not None and close.iloc[-1] > sma200.iloc[-1],
-            "above_sma100": sma100 is not None and close.iloc[-1] > sma100.iloc[-1]
+            "above_sma100": sma100 is not None and close.iloc[-1] > sma100.iloc[-1],
+            # --- Volume Profile (new) ---
+            "poc_tag"           : poc_tag,
+            "va_low"            : va_low_poc,
+            "va_high"           : va_high_poc,
+            "poc_vol_pct"       : poc_pct,
+            "vp_distribution"   : distribution,
+            "vp_profile_type"   : profile_type,
+            "price_in_va"       : price_in_va,
+            # --- VWAP (new) ---
+            "vwap"              : vwap_val,
+            "vwap_tag"          : vwap_tag,
+            "vwap_slope_pct"    : vwap_slope,
+            "vwap_distance_pct" : vwap_dist,
+            "above_1sd"         : above_1sd,
+            "below_1sd"         : below_1sd,
+            # --- Ichimoku (new) ---
+            "ichimoku_score"    : ichi_score,
+            "ichimoku_label"    : ichi_label,
+            "cloud_colour"      : cloud_colour,
+            # --- Earnings / Event (new) ---
+            "event_risk_score"  : event_risk,
+            "event_risk_label"  : event_label,
+            "event_position_advice": event_advice,
         }
 
 
@@ -3041,6 +4124,95 @@ class AIEnsemble:
         quality_edge = max(-12.0, min(15.0, quality_edge))
         weights["quality"] = round(quality_edge, 1)
         score += quality_edge
+
+        # --- 12b. Volume Profile (Weight: 7) ---
+        vp_score = 0.0
+        poc_tag = str(features.get("poc_tag", "UNKNOWN"))
+        in_va   = bool(features.get("price_in_va", False))
+        vp_type = str(features.get("vp_profile_type", "UNKNOWN"))
+
+        if poc_tag == "AT_POC":
+            vp_score += 3
+            signals.append("Price at Volume POC — high liquidity")
+        if poc_tag == "ABOVE_POC" and in_va:
+            vp_score += 4
+            signals.append("Price above POC inside value area")
+        if poc_tag == "BELOW_POC" and in_va:
+            vp_score += 2
+            signals.append("Price below POC inside value area")
+        if vp_type == "ABSORBING":
+            vp_score += 4
+            signals.append("Absorbing volume profile → breakout likely")
+        elif vp_type == "DISTRIBUTED":
+            vp_score -= 2
+            signals.append("Distributed volume profile → exhaustion risk")
+
+        weights["volume_profile"] = round(vp_score, 1)
+        score += vp_score
+
+        # --- 12c. VWAP gauge (Weight: 5) ---
+        vwap_s = 0.0
+        vwap_tag = str(features.get("vwap_tag", "UNKNOWN"))
+        vwap_slope = float(features.get("vwap_slope_pct", 0.0) or 0.0)
+
+        if vwap_tag == "ABOVE_VWAP":
+            vwap_s += 3
+        elif vwap_tag == "DEEP_ABOVE":
+            vwap_s += 4
+        elif vwap_tag == "BELOW_VWAP":
+            vwap_s -= 3
+        elif vwap_tag == "DEEP_BELOW":
+            vwap_s -= 4
+
+        if vwap_slope > 0.01:
+            vwap_s += 2
+            signals.append("VWAP rising — institutional bid present")
+        elif vwap_slope < -0.01:
+            vwap_s -= 2
+            signals.append("VWAP falling — institutional distribution")
+
+        weights["vwap"] = round(vwap_s, 1)
+        score += vwap_s
+
+        # --- 12d. Ichimoku Cloud (Weight: 6) ---
+        ichi_s = 0.0
+        ichi_lbl = str(features.get("ichimoku_label", "NEUTRAL"))
+        cloud_col = str(features.get("cloud_colour", "NEUTRAL"))
+
+        if ichi_lbl in ("STRONG_BULL", "BULLISH"):
+            ichi_s += {"STRONG_BULL": 6, "BULLISH": 3}.get(ichi_lbl, 0)
+            signals.append(f"Ichimoku {ichi_lbl}")
+        elif ichi_lbl in ("WEAK_BEAR", "BEARISH"):
+            ichi_s += {"BEARISH": -3, "WEAK_BEAR": -6}.get(ichi_lbl, 0)
+            signals.append(f"Ichimoku {ichi_lbl}")
+
+        if cloud_col == "GREEN":
+            ichi_s += 2
+            signals.append("Green Ichimoku cloud")
+        elif cloud_col == "RED":
+            ichi_s -= 2
+            signals.append("Red Ichimoku cloud")
+
+        weights["ichimoku"] = round(ichi_s, 1)
+        score += ichi_s
+
+        # --- 12e. Earnings / Event Risk penalty (Weight: -variable) ---
+        evt_s = 0.0
+        evt_risk = float(features.get("event_risk_score", 0.0) or 0.0)
+        evt_advice = str(features.get("event_position_advice", "STANDARD"))
+
+        if evt_advice == "AVOID_NEW":
+            evt_s -= 18                 # strong penalty
+            signals.append(f"⚠ Event risk HIGH ({evt_risk:.0f}) — block new longs")
+        elif evt_advice == "REDUCE_SIZE":
+            evt_s -= 12
+            signals.append(f"⚠ Event risk MEDIUM ({evt_risk:.0f}) — reduce size")
+        elif evt_advice == "HALVE_SIZE":
+            evt_s -= 6
+            signals.append(f"⚠ Event risk LOW-MED ({evt_risk:.0f}) — halve size")
+
+        weights["event_risk"] = round(evt_s, 1)
+        score += evt_s
 
         # --- 13. Market Regime Filter (Weight: Variable) ---
         regime_adjust = 0
@@ -3953,36 +5125,6 @@ class AnalystConsensusEngine:
 # =========================================================
 # PROPOSAL MODEL
 # =========================================================
-
-@dataclass
-class InvestmentProposal:
-    symbol: str
-    direction: str
-    entry_price: float
-    stop_loss: float
-    tp_1: float
-    tp_2: float
-    tp_3: float
-    risk_reward: float
-    risk_reward_extended: float
-    ai_confidence: float
-    ai_grade: str
-    thesis: str
-    setup_type: str
-    position_size_pct: float
-    hold_period: str
-    horizon_confidence: str
-    sector_exposure: str
-    chart_data: Any
-    signals: List[str]
-    weights: Dict[str, Any]
-    # Fundamental quality metrics
-    fundamental_quality: float = 50.0
-    piotroski_f: int = 0
-    altman_z: Optional[float] = None
-
-
-# =========================================================
 # ANALYST CONSENSUS ENGINE
 # =========================================================
 
@@ -4024,7 +5166,7 @@ class AnalystConsensusEngine:
             label = "NEUTRAL"
 
             if avg >= 75:
-                label = "STRONG_BUY"
+                label = "STRONG BUY"
             elif avg >= 60:
                 label = "BUY"
             elif avg <= 35:
@@ -4048,31 +5190,66 @@ class AnalystConsensusEngine:
 
         return result
 
-
-# =========================================================
-# ZACKS ENGINE
-# =========================================================
+import re
+import requests
+from bs4 import BeautifulSoup
+from typing import Dict, Any
 
 class ZacksEngine:
 
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/125.0 Safari/537.36"
+        )
+    }
+
     @staticmethod
     def get_rank(symbol: str) -> Dict[str, Any]:
-
         try:
-            # MOCK SAFE IMPLEMENTATION
-            # Replace with scraper/API later
+            url = f"https://www.zacks.com/stock/quote/{symbol.upper()}"
+
+            resp = requests.get(
+                url,
+                headers=ZacksEngine.HEADERS,
+                timeout=15
+            )
+            resp.raise_for_status()
+
+            html = resp.text
+
+            # Examples:
+            # "Zacks Rank #1 (Strong Buy)"
+            # "Zacks Rank #2 (Buy)"
+            match = re.search(
+                r"Zacks Rank #(\d)\s*\((.*?)\)",
+                html,
+                re.IGNORECASE
+            )
+
+            if not match:
+                return {}
+
+            rank = int(match.group(1))
+            label = match.group(2).strip().upper()
+
+            score_map = {
+                1: 100,
+                2: 80,
+                3: 60,
+                4: 40,
+                5: 20
+            }
 
             return {
-                "rank": 2,
-                "label": "BUY",
-                "score": 82
+                "rank": rank,
+                "label": label,
+                "score": score_map.get(rank, 0)
             }
 
         except Exception as e:
             logger.warning(f"[{symbol}] Zacks failed: {e}")
-
-        return {}
-
+            return {}
 
 # =========================================================
 # YAHOO ANALYST ENGINE
@@ -4289,6 +5466,213 @@ class InvestmentProposal:
     fundamental_quality: float = 50.0
     piotroski_f: int = 0
     altman_z: Optional[float] = None
+    # Trailing stop
+    trailing_stop: float = 0.0
+    trailing_stop_activated: bool = False
+    # Event / earnings risk
+    event_risk_score: float = 0.0
+    event_risk_flags: List[str] = field(default_factory=list)
+
+
+# =========================================================
+# SCANNER (moved from telegram_scanner.py to break circular dependency)
+# =========================================================
+
+def _tf() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _safe(v: Any, default: float = 0.0) -> float:
+    try:
+        f = float(v)
+        return f if not (np.isnan(f) or np.isinf(f)) else default
+    except Exception:
+        return default
+
+
+@dataclass
+class _ScanResult:
+    proposal: InvestmentProposal
+    opp_type: str
+    cap_tier: str
+    sector: str
+
+
+class MarketScanner:
+    def __init__(
+        self,
+        universe: Optional[List[str]] = None,
+        universe_catalog: Optional[Dict[str, Dict[str, str]]] = None,
+        workers: int = _SCAN_WORKERS,
+        min_confidence: float = _MIN_CONFIDENCE,
+    ):
+        self.universe = universe or _STOCK_UNIVERSE
+        self.universe_catalog = universe_catalog or _UNIVERSE_CATALOG
+        self.workers = workers
+        self.min_confidence = min_confidence
+        self._fetcher_errors: Dict[str, str] = {}
+
+    def scan(self, progress_fn=None) -> List[InvestmentProposal]:
+        t0 = time.time()
+        logger.info("═" * 60)
+        logger.info("SCAN START  %s", _tf())
+        logger.info("Universe: %d symbols", len(self.universe))
+
+        cat_opp: Dict[str, int] = {}
+        cat_cap: Dict[str, int] = {}
+        for sym in self.universe:
+            meta = (self.universe_catalog or {}).get(sym, {})
+            opp = meta.get("opp", "MOMENTUM")
+            cap = meta.get("cap", "LARGE")
+            cat_opp[opp] = cat_opp.get(opp, 0) + 1
+            cat_cap[cap] = cat_cap.get(cap, 0) + 1
+
+        active_opps: Dict[str, int] = {k: 0 for k in _OPP_BOOST}
+        active_caps: Dict[str, int] = {k: 0 for k in _CAP_TIER_WEIGHT}
+
+        logger.info("Category overview:")
+        for opp, cnt in sorted(cat_opp.items(), key=lambda x: -x[1]):
+            logger.info("  %-14s %3d symbols", opp, cnt)
+        for cap, cnt in sorted(cat_cap.items(), key=lambda x: -x[1]):
+            logger.info("  %-8s %3d symbols", cap, cnt)
+
+        logger.info("Step 2 / 4: Market regime …")
+        try:
+            market_regime = MarketRegimeEngine.analyze()
+            logger.info(
+                "Regime: %s (score %d)",
+                market_regime.get("_overall"),
+                market_regime.get("_score"),
+            )
+        except Exception as exc:
+            logger.warning("Regime engine failed: %s — using neutral fallback", exc)
+            market_regime = {
+                "_overall": "NEUTRAL",
+                "_score": 0,
+                "_bias": {"direction": "SELECTIVE"},
+                "_timestamp": _tf(),
+            }
+
+        try:
+            sector_rotation = SectorRotationEngine.analyze()
+        except Exception as exc:
+            logger.warning("Sector rotation failed: %s", exc)
+            sector_rotation = None
+
+        logger.info("Step 3 / 4: Per-symbol analysis (%d workers) …", self.workers)
+        raw_results: List[_ScanResult] = []
+        symbols_done = 0
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            fut_map = {
+                pool.submit(self._analyze_symbol, sym, market_regime, sector_rotation): sym
+                for sym in self.universe
+            }
+            for fut in as_completed(fut_map):
+                sym = fut_map[fut]
+                symbols_done += 1
+                if symbols_done % 10 == 0 or symbols_done == len(self.universe):
+                    logger.info(
+                        "  Progress: %d / %d", symbols_done, len(self.universe)
+                    )
+                try:
+                    sr = fut.result(timeout=_SCAN_TIMEOUT_S)
+                    if sr:
+                        raw_results.append(sr)
+                        active_opps[sr.opp_type] = active_opps.get(sr.opp_type, 0) + 1
+                        active_caps[sr.cap_tier] = active_caps.get(sr.cap_tier, 0) + 1
+                        if progress_fn:
+                            progress_fn(sym, "ok", sr.proposal)
+                except Exception as exc:
+                    logger.debug("[%s] analysis error: %s", sym, exc)
+                    self._fetcher_errors[sym] = str(exc)
+
+        logger.info("  Raw results: %d", len(raw_results))
+
+        opp_breakdown = sorted(active_opps.items(), key=lambda x: -x[1])
+        logger.info("Accepted by opp-type: %s", dict(sorted(active_opps.items(), key=lambda x: -x[1])))
+        logger.info("Accepted by cap-tier: %s", dict(sorted(active_caps.items(), key=lambda x: -x[1])))
+
+        logger.info("Step 4 / 4: Ranking …")
+        ranked_proposals = self._rank(raw_results)
+
+        elapsed = time.time() - t0
+        logger.info(
+            "SCAN DONE  %d proposals kept / %d universe / %.1fs",
+            len(ranked_proposals), len(self.universe), elapsed,
+        )
+        return ranked_proposals
+
+    def _analyze_symbol(
+        self,
+        symbol: str,
+        market_regime: Dict[str, Any],
+        sector_rotation: Optional[Dict[str, Any]],
+    ) -> Optional[_ScanResult]:
+        try:
+            meta = (self.universe_catalog or {}).get(symbol, {})
+            opp_type = meta.get("opp", "MOMENTUM")
+            cap_tier = meta.get("cap", "LARGE")
+            sector   = meta.get("sector", "—")
+
+            df_daily = safe_yf_download(
+                symbol,
+                period="1y",
+                interval="1d",
+                retries=2,
+            )
+            if df_daily is None or df_daily.empty or len(df_daily) < 60:
+                return None
+
+            proposal = ProposalEngine.build(
+                symbol=symbol,
+                df=df_daily,
+                market_regime=market_regime,
+                sector_rotation=sector_rotation,
+                use_order_flow=False,
+                use_ml=True,
+            )
+            if proposal is None:
+                return None
+
+            return _ScanResult(
+                proposal=proposal,
+                opp_type=opp_type,
+                cap_tier=cap_tier,
+                sector=sector,
+            )
+
+        except Exception as exc:
+            logger.debug("[%s] _analyze_symbol: %s", symbol, exc)
+            return None
+
+    def _rank(
+        self, hits: List[_ScanResult]
+    ) -> List[InvestmentProposal]:
+        scored: List[Tuple[float, InvestmentProposal, _ScanResult]] = []
+
+        for sr in hits:
+            p = sr.proposal
+            base = (
+                _safe(p.ai_confidence) * 0.70
+                + _safe(getattr(p, "short_term_score", 0)) * 0.30
+            )
+            opp_b  = _OPP_BOOST.get(sr.opp_type,  6.0)
+            cap_b  = _CAP_TIER_WEIGHT.get(sr.cap_tier, 2.0)
+            boosted = round(base * (1.0 + opp_b / 100.0) * (1.0 + cap_b / 100.0), 4)
+            setattr(p, "_composite_score", boosted)
+            setattr(p, "_opp_type",       sr.opp_type)
+            setattr(p, "_cap_tier",       sr.cap_tier)
+            setattr(p, "_category_sector",sr.sector)
+            scored.append((boosted, p, sr))
+
+        filtered = [
+            (score, p, sr) for score, p, sr in scored
+            if _safe(p.ai_confidence) >= self.min_confidence
+        ]
+
+        ranked = sorted(filtered, key=lambda x: -x[0])
+        return [p for _, p, _ in ranked]
 
 
 # =========================================================
@@ -4509,7 +5893,7 @@ class AnalystConsensusEngine:
 class ProposalEngine:
 
     MIN_BARS = 60
-
+    MIN_CONFIDENCE = 48.0
     DEFAULT_RISK_MULTIPLIER = 1.5
 
     # =====================================================
@@ -4649,6 +6033,35 @@ class ProposalEngine:
             )
 
             # ---------------------------------------------
+            # EARNINGS / EVENT CALENDAR RISK CHECK
+            # ---------------------------------------------
+
+            event_risk = EarningsCalendarEngine.assess(symbol)
+            evt_advice  = event_risk.get("position_advice", "STANDARD")
+            event_flags = event_risk.get("flags", [])
+            event_score = float(event_risk.get("risk_score", 0.0))
+
+            if evt_advice == "AVOID_NEW":
+                logger.info(
+                    f"[{symbol}] Blocking new position — high event risk: "
+                    f"{event_risk.get('flags', [])}"
+                )
+                return None
+
+            # Reduce confidence for medium / low-med risks
+            if evt_advice == "REDUCE_SIZE":
+                confidence = max(0, confidence - 8)
+            elif evt_advice == "HALVE_SIZE":
+                confidence = max(0, confidence - 5)
+
+            if confidence < ProposalEngine.MIN_CONFIDENCE:
+                logger.info(
+                    f"[{symbol}] Event-risk penalty pushed confidence to "
+                    f"{confidence:.1f} (< {ProposalEngine.MIN_CONFIDENCE})"
+                )
+                return None
+
+            # ---------------------------------------------
             # TRADE LEVELS
             # ---------------------------------------------
 
@@ -4783,6 +6196,10 @@ class ProposalEngine:
                 fundamental_quality=funds.get("buffett_score", 45.0),
                 piotroski_f=funds.get("piotroski_f", 0),
                 altman_z=funds.get("altman_z"),
+            trailing_stop=round(trade.get("trailing_stop", 0.0), 4),
+            trailing_stop_activated=trade.get("trailing_stop_activated", False),
+            event_risk_score=event_score,
+            event_risk_flags=event_flags,
             )
 
         except Exception as e:
@@ -5263,12 +6680,65 @@ class ProposalEngine:
                         False
                     )
                 ),
+
+            # --- Volume Profile (explicit feature flags) ---
+            "poc_tag"       : techs.get("poc_tag", "UNKNOWN"),
+            "price_in_va"   : techs.get("price_in_va", False),
+            "vp_profile"    : techs.get("vp_profile_type", "UNKNOWN"),
+            "vp_distribution": techs.get("vp_distribution", "UNKNOWN"),
+
+            # --- VWAP (explicit) ---
+            "vwap_tag"      : techs.get("vwap_tag", "UNKNOWN"),
+            "vwap_slope_pct": techs.get("vwap_slope_pct", 0.0),
+
+            # --- Ichimoku (explicit) ---
+            "ichimoku_score": techs.get("ichimoku_score", 50),
+            "cloud_colour"  : techs.get("cloud_colour", "NEUTRAL"),
+
+            # --- Earnings / Event risk (explicit) ---
+            "event_risk_score"  : techs.get("event_risk_score", 0.0),
+            "event_position_advice": techs.get("event_position_advice", "STANDARD"),
         }
         if order_flow:
             for _k, _v in order_flow.items():
                 if isinstance(_k, str) and _k.startswith("of_"):
                     merged[_k] = _v
         return merged
+
+    @staticmethod
+    def _compute_trailing_stop(
+        df: pd.DataFrame,
+        close: float,
+        direction: str,
+        atr: float,
+        lookback: int = 20,
+        trail_atr_mult: float = 1.8,
+        reference_ma_period: int = 20,
+    ) -> float:
+        """
+        Dynamic trailing stop: highest high (long) / lowest low (short) over
+        ``lookback`` bars, anchored to ``reference_ma``, stepped by ``trail_atr_mult``.
+
+        Falls back to static ATR-based stop if insufficient history.
+        """
+        df = normalize_ohlcv(df)
+        if df is None or len(df) < reference_ma_period + 5:
+            return 0.0  # signal no-trailing
+
+        high = df["high"].astype(float)
+        low  = df["low"].astype(float)
+        ref_ma  = high.rolling(reference_ma_period).mean().iloc[-1]
+        if is_long := (direction.upper() == "LONG"):
+            anchor   = float(high.iloc[-lookback:].max())
+            trl_stop = float(anchor - trail_atr_mult * atr)
+            # Floor at the reference MA
+            trl_stop = max(trl_stop, float(ref_ma) - 1.5 * atr)
+            return round(trl_stop, 4)
+        else:
+            anchor   = float(low.iloc[-lookback:].min())
+            trl_stop = float(anchor + trail_atr_mult * atr)
+            trl_stop = min(trl_stop, float(ref_ma) + 1.5 * atr)
+            return round(trl_stop, 4)
 
     @staticmethod
     def _build_trade_levels(
@@ -5279,11 +6749,13 @@ class ProposalEngine:
         smc,
         df
     ):
-
         risk = atr * 1.5
 
-        if direction == "LONG":
+        # --- Trailing stop (initial = static 1.5-sd stop, updated live) ---
+        trl = ProposalEngine._compute_trailing_stop(df, close, direction, atr)
+        trl_activated = bool(trl > 0.0)
 
+        if direction == "LONG":
             sl = close - risk
 
             return {
@@ -5291,6 +6763,8 @@ class ProposalEngine:
                 "tp1": close + risk * 1.5,
                 "tp2": close + risk * 3,
                 "tp3": close + risk * 5,
+                "trailing_stop"       : trl,
+                "trailing_stop_activated": trl_activated,
                 "setup_type": "LONG_SWING"
             }
 
@@ -5301,6 +6775,8 @@ class ProposalEngine:
             "tp1": close - risk * 1.5,
             "tp2": close - risk * 3,
             "tp3": close - risk * 5,
+            "trailing_stop"       : trl,
+            "trailing_stop_activated": trl_activated,
             "setup_type": "SHORT_SWING"
         }
 
@@ -6093,6 +7569,126 @@ def _render_market_dashboard(market_regime, sector_rotation, breadth, proposals=
 
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
+
+# ---------------------------------------------------------------------------
+# Standalone helper: send a ranked-proposal list to Telegram from the UI
+# ---------------------------------------------------------------------------
+
+def send_test_message(text: str = "🧪 Test message from Institutional Scanner") -> bool:
+    """Send a simple test message to verify Telegram is working."""
+    try:
+        notifier = TelegramNotifier()
+    except Exception as exc:
+        logger.error("send_test_message: TelegramNotifier init failed: %s", exc)
+        return False
+
+    if not notifier.token or not notifier.chat_id:
+        logger.warning("Telegram not configured — skipping test message.")
+        return False
+
+    result = notifier.send(text)
+    logger.info("send_test_message: %s (connected: %s)", 
+                "sent" if result else "failed", notifier._connected)
+    return result
+
+
+def send_telegram_results(
+    ranked_proposals: list,
+    market_regime  : Dict[str, Any] | None = None,
+    top_n          : int = 10,
+    total_scanned  : int = 0,
+) -> tuple:
+    """Push *ranked_proposals* to Telegram using a fresh ``TelegramNotifier``.
+
+    Filters to only send stocks with analyst consensus of "BUY" or "STRONG BUY".
+
+    Parameters
+    ----------
+    ranked_proposals:
+        Proposals sorted best-to-worst (``InvestmentProposal``-like objects).
+    market_regime:
+        Market regime dict with ``_overall`` / ``_score`` / ``_bias``.
+        Falls back to ``{"_overall": "RUN", "_score": 0, "_bias": {"direction": "—"}}``
+        when ``None``.
+    top_n:
+        Cap on how many opportunities to send.
+    total_scanned:
+        Universe size for the header.
+
+    Returns
+    -------
+    ``(ok: str, ok_n: int, fail_n: int, detail: str)``
+    *ok* is ``"sent"`` / ``"partial"`` / ``"failed"`` / ``"skipped"``.
+    """
+    try:
+        notifier = TelegramNotifier()
+    except Exception as exc:
+        logger.error("send_telegram_results: TelegramNotifier init failed: %s", exc)
+        return "failed", 0, 0, f"connection error: {exc}"
+
+    # ── Sanity-check ────────────────────────────────────────────────
+    if not notifier.token or not notifier.chat_id:
+        return "skipped", 0, 0, "token or chat-id not configured"
+    if not notifier._connected:
+        logger.warning(
+            "Telegram bot may not be reachable: getMe probe failed at init."
+        )
+
+    # ── Filter for BUY / STRONG BUY only ─────────────────────────────
+    filtered_proposals = []
+    for p in (ranked_proposals or []):
+        ac = getattr(p, "analyst_consensus", None)
+        ac_label = ac.get("label", "") if ac else ""
+        if ac_label in ("STRONG BUY", "BUY"):
+            filtered_proposals.append(p)
+        elif ac_label:
+            logger.debug(f"Filtered out {getattr(p, 'symbol', '?')} - analyst label: {ac_label}")
+
+    logger.info(f"Buy-filter: {len(filtered_proposals)}/{len(ranked_proposals) if ranked_proposals else 0} with BUY/STRONG BUY consensus")
+
+    if not filtered_proposals:
+        logger.info("send_telegram_results: No BUY/STRONG BUY stocks found.")
+        return "skipped", 0, 0, "No BUY/STRONG BUY stocks found in results"
+
+    # Limit to top_n best opportunities
+    filtered_proposals = filtered_proposals[:top_n]
+
+    ok_n, fail_n = notifier.send_scan_summary(
+        ranked_proposals=filtered_proposals,
+        market_regime  =(
+            market_regime
+            if market_regime
+            else {"_overall": "RUN", "_score": 0, "_bias": {"direction": "—"}}
+        ),
+        top_n         =top_n,
+        total_scanned =total_scanned,
+    )
+
+    global _TG_SENT_TOTAL, _TG_FAIL_TOTAL
+    _TG_SENT_TOTAL += ok_n
+    _TG_FAIL_TOTAL += fail_n
+
+    total = ok_n + fail_n
+    if ok_n == total and total > 0:
+        status = "sent"
+    elif ok_n > 0:
+        status = "partial"
+    else:
+        status = "failed"
+
+    detail = (
+        f"{ok_n}/{total} delivered  "
+        f"sent={notifier.sent_count}  fail={notifier.fail_count}  "
+        f"conn={'✅' if notifier._connected else '❌'}"
+    )
+    # Add filter info to detail
+    filtered_count = len(filtered_proposals)
+    original_count = len(ranked_proposals) if ranked_proposals else 0
+    detail = f"{detail} (filtered: {filtered_count}/{original_count} with BUY/STRONG BUY consensus)".rstrip()
+    logger.info("send_telegram_results: %s", detail)
+    return status, ok_n, fail_n, detail
+
+
 def main_ui():
     import streamlit as st
     import numpy as np
@@ -6274,6 +7870,40 @@ def main_ui():
                     st.caption(_line)
     else:
         st.sidebar.caption("Auto-scan is **OFF**.")
+
+    # ── Telegram Status (sidebar) ─────────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📡 Telegram Status")
+
+    if st.session_state.get("tg_conn") is None:
+        try:
+            _probe = TelegramNotifier()
+            st.session_state.tg_conn = _probe._connected
+        except Exception:
+            st.session_state.tg_conn = False
+
+    conn = st.session_state.tg_conn if st.session_state.get("tg_conn") is not None else None
+    conn_icon  = "🟢" if conn else ("🔴" if conn is False else "⚪")
+    conn_label = "Connected" if conn else ("Not connected" if conn is False else "Unknown")
+
+    sent = _TG_SENT_TOTAL
+    fail = _TG_FAIL_TOTAL
+
+    st.sidebar.caption(f"{conn_icon} Bot: **{conn_label}**")
+    if _TG_BOT_TOKEN_RAW:
+        st.sidebar.caption(f"Token: `...{_TG_BOT_TOKEN_RAW[-6:]}`")
+        st.sidebar.caption(f"Chat: `{_TG_CHAT_ID_RAW or _TG_CHAT_ID}`")
+    else:
+        st.sidebar.caption("Token: **not set** (hardcoded fallback)")
+        _chat_tail = str(_TG_CHAT_ID)[-6:] if len(str(_TG_CHAT_ID)) >= 6 else str(_TG_CHAT_ID)
+        st.sidebar.caption(f"Chat: `...{_chat_tail}`")
+    total_n = sent + fail
+    if total_n > 0:
+        st.sidebar.caption(f"Sent ✅: **{sent}**  ·  Failed ❌: **{fail}**  (total: {total_n})")
+    if st.sidebar.button("Re-check Telegram", key="tg_recheck"):
+        st.session_state.tg_conn = None  # force re-probe on next rerender
+        st.rerun()
+
     # =========================================================
     # HELPERS
     # =========================================================
@@ -6469,7 +8099,7 @@ def main_ui():
             except Exception:
                 return None
 
-        with ThreadPoolExecutor(max_workers=16) as ex:
+        with ThreadPoolExecutor(max_workers=3) as ex:
             futures = {ex.submit(fetch, s): s for s in symbols}
 
             for i, f in enumerate(as_completed(futures)):
@@ -6521,11 +8151,77 @@ def main_ui():
                 except Exception:
                     pass
 
+        # -------------------------------------------------------
+        # CORRELATION / SECTOR EXPOSURE ADJUSTMENT (post-scoring)
+        # -------------------------------------------------------
+        if len(proposals) >= 2:
+            corr_result = CorrelationMatrixEngine.compute_exposure_adjustment(
+                proposals
+            )
+            new_sizes_map: Dict[str, float] = corr_result.get("new_sizes", {})
+            for _adj_p in proposals:
+                _key = getattr(_adj_p, "symbol", "")
+                _adj_size = new_sizes_map.get(_key)
+                if _adj_size is not None:
+                    try:
+                        setattr(_adj_p, "position_size_pct", float(_adj_size))
+                        logger.info(
+                            f"[{_key}] Correlation adjustment → position_size_pct={_adj_size}%"
+                        )
+                    except Exception:
+                        pass
+
         # =========================================================
         # SUMMARY
         # =========================================================
 
         st.success(f"Found {len(proposals)} valid setups")
+
+        # Log analyst consensus labels for debugging
+        buy_count = sum(1 for p in proposals if getattr(p, "analyst_consensus", {}).get("label") in ("STRONG BUY", "BUY"))
+        logger.info(f"Telegram preview: {len(proposals)} proposals total, {buy_count} with BUY/STRONG BUY consensus")
+
+        # -------------------------
+        # TELEGRAM SEND CTA
+        # -------------------------
+        _tg_key = "tg_send_result"
+        
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button(
+                "📤 Send Results to Telegram",
+                key=f"_{_tg_key}_btn__{id(proposals)}",
+                help=f"Push these {len(proposals)} proposals to the Telegram chat.",
+            ):
+                # Mark to clear any previous result when proposals are new
+                if st.session_state.get(_tg_key) is not None:
+                    del st.session_state[_tg_key]
+
+                status, ok_n, fail_n, detail = send_telegram_results(
+                    ranked_proposals=proposals,
+                    top_n=10,
+                    total_scanned=len(symbols),
+                )
+                # hide any prior spinner and store result
+                st.session_state[_tg_key] = (status, ok_n, fail_n, detail)
+
+        with col2:
+            if st.button("📮 Test Telegram", key="tg_test_btn", help="Send a test message to verify Telegram is working"):
+                if send_test_message():
+                    st.success("✅ Test message sent!")
+                else:
+                    st.error("❌ Test message failed - check logs")
+
+        _tg_res = st.session_state.get(_tg_key)
+        if _tg_res:
+            _status2, _ok2, _fail2, _detail2 = _tg_res
+            _icon = {
+                "sent"   : "✅",
+                "partial": "⚠️",
+                "failed" : "❌",
+                "skipped": "⏭️",
+            }.get(_status2, "❓")
+            st.info(f"{_icon} Telegram send **{_status2}** — {_detail2}")
 
         # -------------------------
         # SAFE METRICS
@@ -7135,3 +8831,4 @@ def main_ui():
         st.caption(f"Portfolio stance: {bias}")
 if __name__ == "__main__":
     main_ui()
+  
