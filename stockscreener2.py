@@ -44,6 +44,10 @@ from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple
 from types import SimpleNamespace
 
+# Enhanced modules for improved accuracy and profitability
+from enhanced_breakout_engine import EnhancedBreakoutEngine
+from enhanced_risk_manager import EnhancedRiskManager, PerformanceTracker
+
 
 
 # --- Configuration ---
@@ -5952,7 +5956,7 @@ class ProposalEngine:
 
             smc = SMCEngine.detect_structure(df) or {}
 
-            breakout = BreakoutEngine.analyze(
+            breakout = EnhancedBreakoutEngine.analyze(
                 df,
                 smc,
                 df_weekly
@@ -6071,7 +6075,8 @@ class ProposalEngine:
                 atr,
                 breakout,
                 smc,
-                df
+                df,
+                market_regime=market_regime,  # NEW: pass market regime
             )
 
             # ---------------------------------------------
@@ -6100,6 +6105,11 @@ class ProposalEngine:
                 market_regime,
                 ai.get("horizon_confidence"),
                 direction=direction,
+                # Enhanced risk parameters (None for now until we have historical data)
+                win_rate=None,
+                avg_win=None,
+                avg_loss=None,
+                atr_percentile=techs.get("atr_percentile", 50) / 100.0 if "atr_percentile" in techs else 0.5,
             )
 
             # ---------------------------------------------
@@ -6576,7 +6586,8 @@ class ProposalEngine:
         rr = ProposalEngine._calculate_rr(close, sl, tp2)
         rr_ext = ProposalEngine._calculate_rr(close, sl, tp3)
         pos_size = ProposalEngine._calculate_position_size(
-            st_score, rr, {}, "MEDIUM", direction=direction
+            st_score, rr, {}, "MEDIUM", direction=direction,
+            win_rate=None, avg_win=None, avg_loss=None, atr_percentile=0.5
         )
         ai_grade = ProposalEngine._calculate_grade(st_score, "MEDIUM")
         setup_type = f"{direction}_SWING" if direction in ("LONG", "SHORT") else "WATCHLIST"
@@ -6747,37 +6758,53 @@ class ProposalEngine:
         atr,
         breakout,
         smc,
-        df
+        df,
+        market_regime=None,  # NEW: pass market regime
     ):
-        risk = atr * 1.5
-
-        # --- Trailing stop (initial = static 1.5-sd stop, updated live) ---
-        trl = ProposalEngine._compute_trailing_stop(df, close, direction, atr)
-        trl_activated = bool(trl > 0.0)
-
-        if direction == "LONG":
-            sl = close - risk
-
-            return {
-                "sl": sl,
-                "tp1": close + risk * 1.5,
-                "tp2": close + risk * 3,
-                "tp3": close + risk * 5,
-                "trailing_stop"       : trl,
-                "trailing_stop_activated": trl_activated,
-                "setup_type": "LONG_SWING"
-            }
-
-        sl = close + risk
-
+        # Use Enhanced Risk Manager for adaptive stop loss
+        regime = market_regime.get("_overall", "NEUTRAL") if market_regime else "NEUTRAL"
+        
+        # Calculate trend strength from breakout score
+        trend_strength = breakout.get("breakout_score", 50) / 100.0
+        
+        stop_result = EnhancedRiskManager.calculate_adaptive_stop_loss(
+            close=close,
+            atr=atr,
+            direction=direction,
+            regime=regime,
+            trend_strength=trend_strength,
+        )
+        
+        sl = stop_result["stop_loss"]
+        
+        # Calculate optimized take profits
+        tp_result = EnhancedRiskManager.optimize_take_profits(
+            entry=close,
+            stop_loss=sl,
+            direction=direction,
+            atr=atr,
+            regime=regime,
+        )
+        
+        # Calculate trailing stop
+        trl_result = EnhancedRiskManager.calculate_trailing_stop(
+            df=df,
+            direction=direction,
+            atr=atr,
+        )
+        
+        setup_type = f"{direction}_SWING"
+        
         return {
             "sl": sl,
-            "tp1": close - risk * 1.5,
-            "tp2": close - risk * 3,
-            "tp3": close - risk * 5,
-            "trailing_stop"       : trl,
-            "trailing_stop_activated": trl_activated,
-            "setup_type": "SHORT_SWING"
+            "tp1": tp_result["tp1"],
+            "tp2": tp_result["tp2"],
+            "tp3": tp_result["tp3"],
+            "trailing_stop": trl_result["trailing_stop"],
+            "trailing_stop_activated": trl_result["activated"],
+            "setup_type": setup_type,
+            "atr_multiplier": stop_result["atr_multiplier"],
+            "risk_pct": stop_result["risk_pct"],
         }
 
     @staticmethod
@@ -6798,19 +6825,38 @@ class ProposalEngine:
         rr,
         market_regime,
         horizon_confidence,
-        direction="LONG"  # add direction to invert SHORT scores
+        direction="LONG",
+        win_rate=None,        # NEW: optional historical win rate
+        avg_win=None,         # NEW: optional average win
+        avg_loss=None,        # NEW: optional average loss
+        atr_percentile=0.5,   # NEW: ATR percentile for vol adjustment
     ):
-        # Convert to effective confidence: SHORTs use inverted scale
-        if direction == "SHORT":
-            effective = 100 - confidence
-        else:
-            effective = confidence
-
-        edge = max(0, effective - 50)
-
-        size = edge * rr * 0.05
-
-        return min(max(size, 0.5), 5)
+        # Use Enhanced Risk Manager for improved position sizing
+        regime = market_regime.get("_overall", "NEUTRAL") if market_regime else "NEUTRAL"
+        
+        # Calculate regime risk adjustment
+        regime_risk_adj = {
+            "STRONG_BULL": 1.2,
+            "BULL": 1.1,
+            "NEUTRAL": 1.0,
+            "CAUTIOUS": 0.9,
+            "BEAR": 0.8,
+            "STRONG_BEAR": 0.7,
+        }.get(regime, 1.0)
+        
+        result = EnhancedRiskManager.calculate_position_size(
+            confidence=confidence,
+            risk_reward=rr,
+            win_rate=win_rate,
+            avg_win=avg_win,
+            avg_loss=avg_loss,
+            atr_percentile=atr_percentile,
+            market_regime=regime,
+            regime_risk_adjustment=regime_risk_adj,
+            direction=direction,
+        )
+        
+        return result["position_size_pct"]
 
     @staticmethod
     def _calculate_grade(confidence, horizon):
@@ -7812,6 +7858,7 @@ def main_ui():
         if guard is not None:
             return   # daemon already running
         try:
+            # Get interval from widget state if available, otherwise use session_state or default
             interval_h: float = float(st.session_state.get("auto_scan_interval_h", 4.0))
             _th = start_auto_scan(interval_hours=interval_h)
             st.session_state.auto_scan_thread = _th
@@ -7826,6 +7873,11 @@ def main_ui():
     if "auto_scan_interval_h" not in st.session_state:
         st.session_state.auto_scan_interval_h = 4.0
 
+    def update_interval():
+        """Callback to update interval from widget"""
+        # Session state will be updated by the widget automatically
+        pass
+
     st.sidebar.checkbox(
         "Enable auto-scan",
         value=st.session_state.auto_scan_enabled,
@@ -7833,7 +7885,7 @@ def main_ui():
         on_change=_ensure_auto_scan_thread,
         help=(
             "Runs the stock universe scan in the background every "
-            f"{st.session_state.auto_scan_interval_h:.0f} h and pushes the "
+            f"{st.session_state.get('auto_scan_interval_h', 4.0):.0f} h and pushes the "
             "top 10 opportunities to the Telegram chat."
         ),
     )
@@ -7842,10 +7894,9 @@ def main_ui():
         "Scan interval (hours)",
         min_value=1.0,
         max_value=24.0,
-        value=float(st.session_state.auto_scan_interval_h),
         step=0.5,
-        key="auto_scan_interval_h",
-        on_change=_ensure_auto_scan_thread,
+        value=float(st.session_state.auto_scan_interval_h),
+        on_change=update_interval,
     )
 
     if st.session_state.get("auto_scan_enabled"):
@@ -8831,4 +8882,3 @@ def main_ui():
         st.caption(f"Portfolio stance: {bias}")
 if __name__ == "__main__":
     main_ui()
-  
