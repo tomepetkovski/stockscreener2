@@ -13,6 +13,7 @@ Features:
   - Market Breadth (% above 200DMA, advance-decline proxy)
   - Enhanced AI Ensemble with Confluence Weighting
 """
+
 from __future__ import annotations
 import streamlit as st
 import pandas as pd
@@ -82,6 +83,40 @@ class _YFSilentBuffer(_io.StringIO):
         pass
 
 _yf_buf = _YFSilentBuffer()
+
+# ---- tunables added by apply_patches ----
+AI_LONG_THRESHOLD: float = 58.0    # a zero-evidence stock (score 50) is no longer a LONG
+AI_SHORT_THRESHOLD: float = 35.0
+ALLOW_SHORTS: bool = False         # shorts were unreachable anyway (confidence floor)
+
+# ---- shared yfinance .info cache + news-schema helper ----
+_INFO_CACHE: dict = {}
+_INFO_TTL_S = 3600
+_INFO_LOCK = threading.Lock()
+
+
+def get_info_cached(symbol: str) -> dict:
+    now = time.time()
+    with _INFO_LOCK:
+        hit = _INFO_CACHE.get(symbol)
+        if hit and now - hit[0] < _INFO_TTL_S:
+            return hit[1]
+    try:
+        info = yf.Ticker(symbol).info
+        if not isinstance(info, dict):
+            info = {}
+    except Exception:
+        info = {}
+    with _INFO_LOCK:
+        _INFO_CACHE[symbol] = (now, info)
+    return info
+
+
+def news_title(item: dict) -> str:
+    """Works with both the old and the new yfinance news payloads."""
+    t = item.get("title") or (item.get("content") or {}).get("title") or ""
+    return str(t).lower()
+
 
 _yf_error_401_count = 0   # global Yahoo Finance 401 counter (rate-limit throttle)
 
@@ -173,8 +208,8 @@ def safe_yf_download(*args, retries=3, **kwargs):
 # TELEGRAM NOTIFICATION INFRASTRUCTURE
 # ===============================================
 
-_TG_BOT_TOKEN_RAW: str = os.environ.get("TELEGRAM_BOT_TOKEN", "7608970630:AAH5YDKlFdRrxp5pLAwNvoCq4yqIQTTm0yE")
-_TG_CHAT_ID_RAW  : str = os.environ.get("TELEGRAM_CHAT_ID",   "599669892")
+_TG_BOT_TOKEN_RAW: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+_TG_CHAT_ID_RAW  : str = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 def _get_telegram_config() -> tuple[str, str, str]:
     """
@@ -754,11 +789,7 @@ def _run_scan_job(
         ok_n, fail_n = notifier.send_scan_summary(
             ranked_proposals=filtered_ranked,
             total_scanned  =len(scanner.universe),
-            market_regime  ={
-                "_overall": "RUN",
-                "_score"  : 0,
-                "_bias"   : {"direction": "—"},
-            },
+            market_regime=getattr(scanner, "last_regime", None),
             top_n=top_n,
         )
 
@@ -2730,16 +2761,11 @@ class VolumeProfileAnalyzer:
             sorted_idx   = np.argsort(-hist)
             cum_pct      = np.cumsum(hist[sorted_idx]) / total_vol
 
-            va_mask = cum_pct <= value_area_pct
+            k = int(np.searchsorted(cum_pct, value_area_pct)) + 1
+            va_bins = sorted_idx[:k]
 
-            # Always include at least one bin on each side
-            va_mask[0]  = True
-            va_mask[-1] = True
-
-            va_bins     = sorted_idx[va_mask]
-
-            va_low  = float(centres[sorted_idx[va_bins].min()])
-            va_high = float(centres[sorted_idx[va_bins].max()])
+            va_low  = float(centres[va_bins.min()])
+            va_high = float(centres[va_bins.max()])
 
             va_vol_pct = round(100.0 * float(hist[va_bins].sum()) / total_vol, 1)
 
@@ -2966,11 +2992,11 @@ class IchimokuAnalyzer:
             price       = float(close.iloc[last_idx])
             t_cur       = float(tenkan.iloc[last_idx])
             k_cur       = float(kijun.iloc[last_idx])
-            sa_cur      = float(span_a_raw.iloc[last_idx])
-            sb_cur      = float(span_b_raw.iloc[last_idx])
-            chk_cur     = float(chikou.iloc[last_idx])
-            ct_cur      = float(cloud_top.iloc[last_idx])
-            cb_cur      = float(cloud_bot.iloc[last_idx])
+            sa_cur = float(span_a_raw.iloc[-27])
+            sb_cur = float(span_b_raw.iloc[-27])
+            chk_cur = price
+            ct_cur = max(sa_cur, sb_cur)
+            cb_cur = min(sa_cur, sb_cur)
 
             # --- Cloud colour ---
             cloud_bullish = sa_cur > sb_cur
@@ -3085,113 +3111,81 @@ _EVENT_SEVERITY: Dict[str, int] = {
 
 class EarningsCalendarEngine:
     """
-    Lightweight catalyst-risk engine built on Yahoo Finance news headlines
-    attached to the ticker.  No paid API is required.
-
-    For every symbol it fetches the last 8 headlines, scans for known
-    high-impact event keywords, and returns a single ``risk_score`` (0–100)
-    that can be used to halve or block a position.
+    Catalyst-risk engine. Uses the real next-earnings date (yfinance calendar)
+    plus non-earnings event keywords found in current headlines.
     """
 
     _CACHE: Dict[str, Dict[str, Any]] = {}
-    _CACHE_TTL_S: int = 1800   # 30 min
+    _CACHE_TTL_S: int = 1800
 
-    @classmethod
     @staticmethod
-    def assess(
-        symbol: str,
-        *,
-        ttl: int = _CACHE_TTL_S,
-    ) -> Dict[str, Any]:
+    def _days_to_earnings(symbol: str):
+        try:
+            cal = yf.Ticker(symbol).calendar
+            dates = None
+            if isinstance(cal, dict):
+                dates = cal.get("Earnings Date")
+            elif cal is not None and hasattr(cal, "index") and "Earnings Date" in cal.index:
+                dates = list(cal.loc["Earnings Date"])
+            if not dates:
+                return None
+            if not isinstance(dates, (list, tuple)):
+                dates = [dates]
+            today = datetime.now(timezone.utc).date()
+            days = [(pd.Timestamp(d).date() - today).days for d in dates]
+            days = [d for d in days if d >= 0]
+            return min(days) if days else None
+        except Exception:
+            return None
 
-        import time as _time
+    @staticmethod
+    def assess(symbol: str, *, ttl: int = 1800) -> Dict[str, Any]:
+        now = time.time()
+        hit = EarningsCalendarEngine._CACHE.get(symbol)
+        if hit and now - hit["ts"] < ttl:
+            return hit["data"]
 
-        now = _time.time()
-
-        cached = EarningsCalendarEngine._CACHE.get(symbol)
-
-        if cached and (now - cached["ts"]) < ttl:
-
-            return cached["data"]
+        risk = 0.0
+        flags: List[str] = []
+        d = EarningsCalendarEngine._days_to_earnings(symbol) if symbol else None
+        if d is not None:
+            if d <= 5:
+                risk += 60
+                flags.append(f"earnings in {d}d (+60)")
+            elif d <= 10:
+                risk += 40
+                flags.append(f"earnings in {d}d (+40)")
+            elif d <= 14:
+                risk += 28
+                flags.append(f"earnings in {d}d (+28)")
 
         try:
-
-            ticker   = yf.Ticker(symbol)
-            news_raw = ticker.news or []
-
-            risk_score = 0
-            flags: List[str] = []
-            days_ahead = 14  # Conservative look-ahead window
-
-            for item in news_raw[:10]:
-
-                title = (item.get("title") or "").lower()
-                publisher = (item.get("publisher") or "").lower()
-
-                # Calculate how "soon" this news item is
-                pub_ts  = item.get("providerPublishTime", 0)
-                age_days = max(0, (now - pub_ts) / 86400.0) if pub_ts else 999
-
+            for item in (yf.Ticker(symbol).news or [])[:10]:
+                title = news_title(item)
                 for kw, sev in _EVENT_SEVERITY.items():
-
+                    if kw == "earnings":
+                        continue
                     if kw in title:
+                        risk += sev * 0.5
+                        flags.append(f"{kw} headline")
+                        break
+        except Exception:
+            pass
 
-                        # Attenuate by proximity: full weight at day 0, zero at day 14
-                        proximity = max(0.0, 1.0 - age_days / max(days_ahead, 1))
+        risk = float(np.clip(risk, 0, 100))
+        out = {
+            "risk_score": round(risk, 1),
+            "label": "HIGH" if risk >= 50 else "MEDIUM" if risk >= 25 else "LOW",
+            "flags": flags,
+            "position_advice": "AVOID_NEW" if risk >= 50
+                               else "REDUCE_SIZE" if risk >= 35
+                               else "HALVE_SIZE" if risk >= 25
+                               else "STANDARD",
+            "days_to_earnings": d,
+        }
+        EarningsCalendarEngine._CACHE[symbol] = {"data": out, "ts": now}
+        return out
 
-                        risk_score = min(100, risk_score + int(sev * proximity))
-
-                        flags.append(f"{kw} (+{int(sev * proximity)})")
-
-                        break  # one event per headline
-
-            risk_score = float(np.clip(risk_score, 0, 100))
-
-            if risk_score >= 50:
-
-                label = "HIGH"
-
-            elif risk_score >= 25:
-
-                label = "MEDIUM"
-
-            else:
-
-                label = "LOW"
-
-            result: Dict[str, Any] = {
-                "risk_score"    : round(risk_score, 1),
-                "label"         : label,
-                "flags"         : flags,
-                "position_advice": "AVOID_NEW"        if risk_score >= 50
-                             else "REDUCE_SIZE"     if risk_score >= 35
-                             else "HALVE_SIZE"      if risk_score >= 25
-                             else "STANDARD",
-                "raw_headlines" : 0 if not news_raw else len(news_raw),
-            }
-
-            EarningsCalendarEngine._CACHE[symbol] = {
-
-                "data": result,
-                "ts"  : now,
-
-            }
-
-            return result
-
-        except Exception as e:
-
-            logger.debug("EarningsCalendarEngine %s: %s", symbol, e)
-
-            return {
-
-                "risk_score"     : 0.0,
-                "label"          : "LOW",
-                "flags"          : [],
-                "position_advice": "STANDARD",
-                "raw_headlines"  : 0,
-
-            }
 
 
 # ===============================================
@@ -3239,13 +3233,14 @@ class CorrelationMatrixEngine:
     MAX_CORR_PAIR_PENALTY: float = 0.35
 
     _cache_history: Dict[str, pd.Series] = {}
+    _cache_ts: Dict[str, float] = {}
 
     @classmethod
     def _get_returns(cls, symbol: str, period: str = "3mo") -> Optional[pd.Series]:
 
         cached = cls._cache_history.get(symbol)
 
-        if cached is not None:
+        if cached is not None and time.time() - cls._cache_ts.get(symbol, 0) < 21600:
 
             return cached
 
@@ -3270,6 +3265,8 @@ class CorrelationMatrixEngine:
             rets = df["close"].pct_change().dropna()
 
             cls._cache_history[symbol] = rets
+
+            cls._cache_ts[symbol] = time.time()
 
             return rets
 
@@ -3576,7 +3573,7 @@ class TechnicalEngine:
         cloud_colour= ichi.get("cloud_colour", "NEUTRAL")
 
         # --- Earnings / Event Risk ---
-        evt = EarningsCalendarEngine.assess(getattr(df, "name", "") or "")
+        evt = {}
 
         event_risk = evt.get("risk_score", 0.0)
         event_label= evt.get("label", "LOW")
@@ -3638,8 +3635,7 @@ class FundamentalEngine:
     @staticmethod
     def get_fundamentals(symbol: str) -> Dict:
         try:
-            t = yf.Ticker(symbol)
-            info = t.info
+            info = get_info_cached(symbol)
             
             pe = info.get("forwardPE", info.get("trailingPE", 0)) or 0
             pb = info.get("priceToBook", 0) or 0
@@ -3708,14 +3704,14 @@ class FundamentalEngine:
                 # Profitability
                 if net_income and net_income > 0:
                     f_score += 1
-                if info.get("operatingCashflow", 0) > 0:
+                if (info.get("operatingCashflow") or 0) > 0:
                     f_score += 1
                 if roe and roe > 0.10:
                     f_score += 1
                 # Leverage / Liquidity
-                if info.get("debtToEquity", 999) < 0.5:
+                if (info.get("debtToEquity") or 999) < 50:
                     f_score += 1
-                if info.get("currentRatio", 0) > 1.0:
+                if (info.get("currentRatio") or 0) > 1.0:
                     f_score += 1
                 # Operating efficiency (ROA improvement proxy)
                 if roe and roe > 0.12:
@@ -3812,8 +3808,11 @@ class BuffettAnalyzer:
             scores["roe"] = 0
 
         # --- 2. Debt-to-Equity ---
-        dte = cls._safe_float(info.get("debtToEquity"))
-        if dte < 0.3:
+        _dte_raw = info.get("debtToEquity")
+        dte = cls._safe_float(_dte_raw) / 100.0
+        if _dte_raw is None:
+            scores["debt"] = 5
+        elif dte < 0.3:
             scores["debt"] = 10
         elif dte < 0.5:
             scores["debt"] = 8
@@ -3850,7 +3849,9 @@ class BuffettAnalyzer:
 
         # --- 6. P/E Ratio ---
         pe = cls._safe_float(info.get("forwardPE"))
-        if pe < 15:
+        if pe <= 0:
+            scores["pe"] = 0
+        elif pe < 15:
             scores["pe"] = 10
         elif pe < 25:
             scores["pe"] = 7
@@ -3942,7 +3943,7 @@ class SentimentEngine:
             score = 50
             headlines = []
             for item in news[:8]:
-                title = item.get("title", "").lower()
+                title = news_title(item)
                 headlines.append(title)
                 for w in title.split():
                     w_clean = w.strip(".,!?;:\"'()[]{}")
@@ -4219,22 +4220,17 @@ class AIEnsemble:
         score += evt_s
 
         # --- 13. Market Regime Filter (Weight: Variable) ---
-        regime_adjust = 0
+        regime_adjust = 0.0
         if market_regime:
-            bias = market_regime.get("_bias", {})
-            regime_dir = bias.get("direction", "SELECTIVE")
-            regime_conf = bias.get("confidence", 50)
-            
-            if regime_dir in ["PRESERVATION", "RISK_OFF"]:
-                # Dampen long signals in bear markets
-                if score > 50:
-                    regime_adjust = -(regime_conf * 0.2)
-                    signals.append(f"Market regime {market_regime.get('_overall')}: reducing long exposure")
-            elif regime_dir in ["STRONG_BULL", "BULL"]:
-                # Boost long signals in bull markets
-                if score > 50:
-                    regime_adjust = (regime_conf * 0.1)
-                    signals.append(f"Market regime {market_regime.get('_overall')}: favoring longs")
+            _ov = market_regime.get("_overall", "NEUTRAL")
+            _pen = {"CAUTIOUS": 4.0, "BEAR": 10.0, "STRONG_BEAR": 15.0}.get(_ov, 0.0)
+            _bon = {"BULL": 3.0, "STRONG_BULL": 5.0}.get(_ov, 0.0)
+            if score > 50 and _pen:
+                regime_adjust = -_pen
+                signals.append(f"Market regime {_ov}: long penalty -{_pen:.0f}")
+            elif score > 50 and _bon:
+                regime_adjust = _bon
+                signals.append(f"Market regime {_ov}: long tailwind +{_bon:.0f}")
         
         weights["regime"] = round(regime_adjust, 1)
         score += regime_adjust
@@ -4324,7 +4320,8 @@ class AIEnsemble:
             weights["order_flow"] = 0.0
 
         # --- 14. ML prognosis (history-trained probabilities) ---
-        if ml_forecast and ml_forecast.get("trained"):
+        if (ml_forecast and ml_forecast.get("trained")
+                and (ml_forecast.get("balanced_accuracy_holdout") or 0) >= 0.38):
             pl = float(ml_forecast.get("p_long", 1.0 / 3.0))
             ps = float(ml_forecast.get("p_short", 1.0 / 3.0))
             ml_edge = (pl - ps) * 35.0
@@ -4342,9 +4339,9 @@ class AIEnsemble:
         # --- FINAL SCORING ---
         score = float(np.clip(score, 0, 100))
 
-        if score >= 50:
+        if score >= AI_LONG_THRESHOLD:
             direction = "LONG"
-        elif score <= 35:
+        elif score <= AI_SHORT_THRESHOLD:
             direction = "SHORT"
         else:
             direction = "NEUTRAL"
@@ -4353,16 +4350,16 @@ class AIEnsemble:
             pl = float(ml_forecast.get("p_long", 1.0 / 3.0))
             ps = float(ml_forecast.get("p_short", 1.0 / 3.0))
             if direction == "LONG" and pl < 0.26 and ps > pl + 0.08:
-                if score >= 58:  # 8-pt buffer keeps ≥50 after penalty
+                if score >= AI_LONG_THRESHOLD + 8:  # 8-pt buffer keeps ≥50 after penalty
                     score = max(0.0, score - 8.0)
                     signals.append("ML conflict: probabilities lean SHORT vs rule-based LONG")
             elif direction == "SHORT" and ps < 0.26 and pl > ps + 0.08:
                 score = max(0.0, score - 8.0)  # Safe: lowers score further into SHORT
                 signals.append("ML conflict: probabilities lean LONG vs rule-based SHORT")
             score = float(np.clip(score, 0, 100))
-            if score >= 50:
+            if score >= AI_LONG_THRESHOLD:
                 direction = "LONG"
-            elif score <= 35:
+            elif score <= AI_SHORT_THRESHOLD:
                 direction = "SHORT"
             else:
                 direction = "NEUTRAL"
@@ -4644,11 +4641,8 @@ class MLPrognosisEngine:
         inst_footprint = ((vol_ratio > 1.3) & (rng_ratio < 0.5)).astype(float)
 
         fwd = c.shift(-cls.FORWARD_H) / (c + 1e-12) - 1.0
-        y = np.where(
-            fwd > cls.RET_TH,
-            2,
-            np.where(fwd < -cls.RET_TH, 0, 1),
-        )
+        _thr = 0.6 * (atr / (c + 1e-12)) * np.sqrt(cls.FORWARD_H)
+        y = np.where(fwd > _thr, 2, np.where(fwd < -_thr, 0, 1))
         mat = pd.DataFrame(
             {
                 "r1": r1,
@@ -4744,7 +4738,7 @@ class MLPrognosisEngine:
                 pass
 
         hold = max(int(n * 0.15), 30)
-        X_train, y_train = X[:-hold], y[:-hold]
+        X_train, y_train = X[:-hold - cls.FORWARD_H], y[:-hold - cls.FORWARD_H]
         X_test, y_test = X[-hold:], y[-hold:]
 
         # Initialize additional metrics
@@ -4785,7 +4779,7 @@ class MLPrognosisEngine:
 
         cv_mean = None
         try:
-            tsc = TimeSeriesSplit(n_splits=min(5, max(2, n // 80)))
+            tsc = TimeSeriesSplit(n_splits=min(5, max(2, n // 80)), gap=cls.FORWARD_H)
             scores = cross_val_score(
                 pipe,
                 X_train,
@@ -4841,7 +4835,11 @@ class MLPrognosisEngine:
             # Brier score (calibration) - only for probabilistic predictions
             try:
                 proba = pipe.predict_proba(X_test)
-                brier_score = float(brier_score_loss(y_test, proba))
+                _cls = list(pipe.named_steps["clf"].classes_)
+                _oh = np.zeros_like(proba)
+                for _j, _c in enumerate(_cls):
+                    _oh[:, _j] = (np.asarray(y_test) == _c)
+                brier_score = float(np.mean(np.sum((proba - _oh) ** 2, axis=1)))
             except Exception:
                 brier_score = None
 
@@ -5313,6 +5311,27 @@ class YahooFinanceAnalystEngine(YahooFinanceEngine):
 # NASDAQ ENGINE
 # =========================================================
 
+class YahooConsensusEngine:
+    """Real signal: recommendationMean (1=strong buy .. 5=sell) + target upside."""
+
+    @staticmethod
+    def get_rating(symbol: str) -> dict:
+        info = get_info_cached(symbol)
+        mean = info.get("recommendationMean")
+        n = int(info.get("numberOfAnalystOpinions") or 0)
+        if not mean or n < 5:
+            return {}
+        score = float(np.clip((5.0 - float(mean)) / 4.0 * 100.0, 0, 100))
+        px = info.get("currentPrice") or info.get("regularMarketPrice")
+        tgt = info.get("targetMeanPrice")
+        upside = None
+        if px and tgt:
+            upside = (float(tgt) / float(px) - 1.0) * 100.0
+            score = float(np.clip(score + np.clip(upside, -20, 30) * 0.5, 0, 100))
+        return {"score": score, "source": "Yahoo consensus", "analysts": n,
+                "upside_pct": None if upside is None else round(upside, 1)}
+
+
 class NasdaqEngine:
 
     @staticmethod
@@ -5320,10 +5339,7 @@ class NasdaqEngine:
 
         try:
 
-            return {
-                "score": 74,
-                "source": "Nasdaq Analysts"
-            }
+            return {}
 
         except Exception:
             return {}
@@ -5344,10 +5360,7 @@ class BarronsEngine:
 
         try:
 
-            return {
-                "score": 68,
-                "source": "Barrons"
-            }
+            return {}
 
         except Exception:
             return {}
@@ -5368,10 +5381,7 @@ class MotleyFoolEngine:
 
         try:
 
-            return {
-                "score": 72,
-                "source": "Motley Fool"
-            }
+            return {}
 
         except Exception:
             return {}
@@ -5392,10 +5402,7 @@ class InsiderMonkeyEngine:
 
         try:
 
-            return {
-                "score": 77,
-                "hedge_fund_sentiment": "BULLISH"
-            }
+            return {}
 
         except Exception:
             return {}
@@ -5563,6 +5570,7 @@ class MarketScanner:
             logger.warning("Sector rotation failed: %s", exc)
             sector_rotation = None
 
+        self.last_regime = market_regime
         logger.info("Step 3 / 4: Per-symbol analysis (%d workers) …", self.workers)
         raw_results: List[_ScanResult] = []
         symbols_done = 0
@@ -5621,7 +5629,7 @@ class MarketScanner:
 
             df_daily = safe_yf_download(
                 symbol,
-                period="1y",
+                period="2y",
                 interval="1d",
                 retries=2,
             )
@@ -5693,11 +5701,8 @@ class MarketScanner:
 class AnalystConsensusEngine:
 
     WEIGHTS = {
-        "zacks": 0.25,
-        "barrons": 0.15,
-        "motley_fool": 0.10,
-        "insider_monkey": 0.10,
-        "nasdaq": 0.20,
+        "zacks": 0.35,
+        "yahoo_consensus": 0.45,
         "yahoo": 0.20,
     }
 
@@ -5713,10 +5718,7 @@ class AnalystConsensusEngine:
 
             raw_sources = {
                 "zacks": ZacksEngine.get_rank(symbol),
-                "barrons": BarronsEngine.get_rating(symbol),
-                "motley_fool": MotleyFoolEngine.get_rating(symbol),
-                "insider_monkey": InsiderMonkeyEngine.get_sentiment(symbol),
-                "nasdaq": NasdaqAnalystEngine.get_rating(symbol),
+                "yahoo_consensus": YahooConsensusEngine.get_rating(symbol),
                 "yahoo": YahooFinanceAnalystEngine.get_rating(symbol),
             }
 
@@ -5953,6 +5955,12 @@ class ProposalEngine:
             # ---------------------------------------------
 
             techs = TechnicalEngine.get_indicators(df) or {}
+            _evt0 = EarningsCalendarEngine.assess(symbol)
+            techs.update(
+                event_risk_score=_evt0.get("risk_score", 0.0),
+                event_risk_label=_evt0.get("label", "LOW"),
+                event_position_advice=_evt0.get("position_advice", "STANDARD"),
+            )
 
             smc = SMCEngine.detect_structure(df) or {}
 
@@ -6029,6 +6037,9 @@ class ProposalEngine:
             )
 
             if direction == "NEUTRAL":
+                return None
+
+            if direction == "SHORT" and not ALLOW_SHORTS:
                 return None
 
             confidence = ProposalEngine._safe_float(
@@ -6181,14 +6192,14 @@ class ProposalEngine:
 
                 position_size_pct=pos_size,
 
-                hold_period="1-3 Months",
+                hold_period="6-12 Months" if ai.get("horizon_confidence") == "HIGH" else "3-6 Months",
 
                 horizon_confidence=ai.get(
                     "horizon_confidence",
                     "MEDIUM"
                 ),
 
-                sector_exposure="NEUTRAL",
+                sector_exposure=_UNIVERSE_CATALOG.get(symbol, {}).get("sector", "DEFAULT"),
 
                 chart_data=None,
 
@@ -6634,7 +6645,7 @@ class ProposalEngine:
             "setup_type": setup_type,
             "hold_period": "1-3 Months",
             "horizon_confidence": "MEDIUM",
-            "sector_exposure": "NEUTRAL",
+            "sector_exposure": _UNIVERSE_CATALOG.get(symbol, {}).get("sector", "DEFAULT"),
             "chart_data": None,
             "signals": [],
             "weights": {},
@@ -7368,10 +7379,10 @@ def compute_market_pressure(market_regime, breadth, sector_rotation):
 
     ranked = sector_rotation.get("ranked", [])
     if ranked:
-        sector_score = sum(
+        sector_score = 50 + 4 * (sum(
             safe_num(d.get("momentum_score"))
             for _, d in ranked[:5]
-        ) / max(1, min(5, len(ranked)))
+        ) / max(1, min(5, len(ranked))))
     else:
         sector_score = 50
 
@@ -7413,10 +7424,10 @@ def detect_rotation_divergence(sector_rotation, breadth):
     top_momentum = safe_num(data.get("momentum_score"))
     breadth_strength = safe_num(breadth.get("pct_above_50dma"))
 
-    if top_momentum > 75 and breadth_strength < 45:
+    if top_momentum > 8 and breadth_strength < 45:
         return "⚠️ NARROW RALLY (Top-heavy market)"
 
-    if top_momentum < 40 and breadth_strength > 60:
+    if top_momentum < 2 and breadth_strength > 60:
         return "⚠️ LATENT ACCUMULATION (hidden strength)"
 
     return None
@@ -7942,7 +7953,7 @@ def main_ui():
 
     st.sidebar.caption(f"{conn_icon} Bot: **{conn_label}**")
     if _TG_BOT_TOKEN_RAW:
-        st.sidebar.caption(f"Token: `...{_TG_BOT_TOKEN_RAW[-6:]}`")
+        st.sidebar.caption("Token: configured")
         st.sidebar.caption(f"Chat: `{_TG_CHAT_ID_RAW or _TG_CHAT_ID}`")
     else:
         st.sidebar.caption("Token: **not set** (hardcoded fallback)")
@@ -8250,6 +8261,7 @@ def main_ui():
 
                 status, ok_n, fail_n, detail = send_telegram_results(
                     ranked_proposals=proposals,
+                    market_regime=market_regime,
                     top_n=10,
                     total_scanned=len(symbols),
                 )
