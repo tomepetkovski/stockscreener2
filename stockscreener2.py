@@ -519,6 +519,8 @@ class TelegramNotifier:
                 f"🔑 <b>Signals:</b>",
                 sig_md,
                 "",
+                f"🧪 <b>Backtest:</b> {safe_num(getattr(p,'bt_win_rate',0))*100:.0f}% win · {safe_num(getattr(p,'bt_expectancy_R',0)):+.2f}R · n={getattr(p,'bt_trades',0)}",
+                "",
                 f"<i>For informational purposes only — not financial advice.</i>",
             ]
             return self.send("\n".join(block))
@@ -997,8 +999,21 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
         for col in cols:
 
+            series = df[col]
+
+            # yfinance sometimes returns a 2-d DataFrame (MultiIndex columns) or a
+            # Series of dicts instead of a plain 1-d numeric Series. Flatten first.
+            if isinstance(series, pd.DataFrame):
+                series = series.iloc[:, 0]
+            if isinstance(series, pd.Series):
+                series = series.apply(
+                    lambda v: list(v.values())[0] if isinstance(v, dict) and v else v
+                )
+            else:
+                series = pd.Series(series)
+
             df[col] = pd.to_numeric(
-                df[col],
+                series,
                 errors="coerce"
             )
 
@@ -1186,8 +1201,8 @@ def build_synthetic_weekly(df_daily: pd.DataFrame):
 def fetch_multi_timeframe(
     symbol: str,
     *,
-    daily_period: str = "1y",
-    weekly_period: str = "2y",
+    daily_period: str = "5y",
+    weekly_period: str = "5y",
 ) -> Dict[str, pd.DataFrame]:
     """
     Fetch multiple timeframes for top-down analysis.
@@ -2723,6 +2738,9 @@ class VolumeProfileAnalyzer:
 
         df = normalize_ohlcv(df)
 
+        if df is not None and len(df) > 120:
+            df = df.iloc[-120:]
+
         if df is None or len(df) < 30:
 
             return {"status": "NO_DATA"}
@@ -2864,9 +2882,12 @@ def _compute_vwap_bands(
         tp  = (df["high"] + df["low"] + df["close"]) / 3.0
         v   = df["volume"].astype(float).clip(lower=0.0)
 
-        vwap  = (tp * v).cumsum() / (v.cumsum() + 1e-12)
-        vsq   = v * (tp - vwap) ** 2
-        var   = vsq.cumsum() / (v.cumsum() + 1e-12)
+        # Rolling VWAP (63-bar window) for more responsive bands
+        w = 63
+        pv = (tp * v).rolling(w, min_periods=20).sum()
+        vv = v.rolling(w, min_periods=20).sum() + 1e-12
+        vwap = pv / vv
+        var = (v * (tp - vwap) ** 2).rolling(w, min_periods=20).sum() / vv
 
         std   = var.pow(0.5)
         last  = float(df["close"].iloc[-1])
@@ -4321,7 +4342,7 @@ class AIEnsemble:
 
         # --- 14. ML prognosis (history-trained probabilities) ---
         if (ml_forecast and ml_forecast.get("trained")
-                and (ml_forecast.get("balanced_accuracy_holdout") or 0) >= 0.38):
+                and (ml_forecast.get("balanced_accuracy_holdout") or 0) >= 0.40):
             pl = float(ml_forecast.get("p_long", 1.0 / 3.0))
             ps = float(ml_forecast.get("p_short", 1.0 / 3.0))
             ml_edge = (pl - ps) * 35.0
@@ -4335,6 +4356,21 @@ class AIEnsemble:
                 cv_a = ml_forecast.get("cv_accuracy_mean")
                 cv_s = f"{cv_a:.3f}" if cv_a is not None else "n/a"
                 signals.append(f"ML ensemble favors SHORT (p={ps:.2f}; CV acc≈{cv_s})")
+
+        # --- Relative strength vs SPY ---
+        rs = float(features.get("rs_60d", 0) or 0)
+        rs_s = float(np.clip(rs * 0.4, -8, 8))
+        weights["rel_strength"] = round(rs_s, 1)
+        score += rs_s
+        if rs > 5:
+            signals.append(f"Outperforming SPY by {rs:.1f}% (60d)")
+
+        # --- Cap the correlated trend family ---
+        fam = sum(float(weights.get(k, 0) or 0) for k in
+                  ("trend", "ma_confluence", "ichimoku", "vwap", "momentum", "rel_strength"))
+        if abs(fam) > 22:
+            score -= fam - float(np.clip(fam, -22, 22))
+            signals.append("Trend-family contribution capped (correlated factors)")
 
         # --- FINAL SCORING ---
         score = float(np.clip(score, 0, 100))
@@ -4589,10 +4625,10 @@ class MLPrognosisEngine:
             return (False,) + (None,) * 7
 
     @classmethod
-    def _build_training_frame(cls, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    def _build_training_frame(cls, df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
         df = normalize_ohlcv(df)
         if df is None or df.empty or len(df) < cls.MIN_SAMPLES + cls.FORWARD_H + 5:
-            return None
+            return None, None
         c = df["close"].astype(float)
         h = df["high"].astype(float)
         low = df["low"].astype(float)
@@ -4662,10 +4698,15 @@ class MLPrognosisEngine:
                 "y": y,
             }
         )
+        # Patch 1: Extract live features before trimming to avoid stale ML row
+        feat_cols = [c for c in mat.columns if c != "y"]
+        live = mat[feat_cols].iloc[[-1]]  # today's features, before trimming
+        if live.isna().any().any():
+            live = None
         mat = mat.iloc[: -cls.FORWARD_H].dropna()
-        if mat is None or len(mat) < cls.MIN_SAMPLES:
-            return None
-        return mat
+        if len(mat) < cls.MIN_SAMPLES:
+            return None, None
+        return mat, live
 
     @classmethod
     def forecast(
@@ -4712,7 +4753,7 @@ class MLPrognosisEngine:
             empty["error"] = "scikit-learn not available"
             return empty
 
-        mat = cls._build_training_frame(df)
+        mat, live = cls._build_training_frame(df)
         if mat is None or mat.empty:
             empty["error"] = "insufficient_history"
             return empty
@@ -4754,7 +4795,7 @@ class MLPrognosisEngine:
                         max_depth=14,
                         min_samples_leaf=6,
                         random_state=42,
-                        n_jobs=-1,
+                        n_jobs=1,
                     ),
                 ),
                 (
@@ -4768,7 +4809,7 @@ class MLPrognosisEngine:
                 ),
             ],
             voting="soft",
-            n_jobs=-1,
+            n_jobs=1,
         )
         pipe = Pipeline(
             [
@@ -4786,7 +4827,7 @@ class MLPrognosisEngine:
                 y_train,
                 cv=tsc,
                 scoring="accuracy",
-                n_jobs=-1,
+                n_jobs=1,
             )
             cv_mean = float(np.mean(scores))
         except Exception as e:
@@ -4884,7 +4925,9 @@ class MLPrognosisEngine:
             logger.debug("ML full-sample refit failed %s: %s", symbol, e)
 
         try:
-            proba = pipe.predict_proba(X[-1:].reshape(1, -1))[0]
+            # Patch 1: Use live features instead of stale training row
+            x_pred = live[feature_cols].to_numpy(dtype=float).reshape(1, -1) if live is not None else X[-1:].reshape(1, -1)
+            proba = pipe.predict_proba(x_pred)[0]
             classes = list(pipe.named_steps["clf"].classes_)
             pi = {int(classes[j]): float(proba[j]) for j in range(len(classes))}
             p_long = float(pi.get(2, 0.0))
@@ -5483,6 +5526,10 @@ class InvestmentProposal:
     # Event / earnings risk
     event_risk_score: float = 0.0
     event_risk_flags: List[str] = field(default_factory=list)
+    # Backtest metrics
+    bt_win_rate: Optional[float] = None
+    bt_expectancy_R: Optional[float] = None
+    bt_trades: int = 0
 
 
 # =========================================================
@@ -5629,7 +5676,7 @@ class MarketScanner:
 
             df_daily = safe_yf_download(
                 symbol,
-                period="2y",
+                period="5y",
                 interval="1d",
                 retries=2,
             )
@@ -5893,6 +5940,111 @@ class AnalystConsensusEngine:
 
 
 # =========================================================
+# SIGNAL BACKTESTER
+# =========================================================
+
+class SignalBacktester:
+    """Walk-forward backtester to measure win rate and expectancy of signal rules."""
+    HORIZON = 40
+    MIN_TRADES = 12
+    _CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+    _TTL = 6 * 3600
+
+    @staticmethod
+    def _wilson_lb(wins: int, n: int, z: float = 1.28) -> float:
+        """Wilson lower bound for binomial proportion confidence interval."""
+        if n == 0:
+            return 0.0
+        p = wins / n
+        d = 1 + z * z / n
+        centre = p + z * z / (2 * n)
+        adj = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)
+        return (centre - adj) / d
+
+    @classmethod
+    def run(cls, symbol: str, df: pd.DataFrame,
+            stop_atr: float = 2.0, target_rr: float = 2.0,
+            cost_pct: float = 0.001) -> Dict[str, Any]:
+        """
+        Run walk-forward backtest on historical data.
+        Simulates trades with trend + breakout/pullback signals.
+        """
+        hit = cls._CACHE.get(symbol)
+        if hit and time.time() - hit[0] < cls._TTL:
+            return hit[1]
+        df = normalize_ohlcv(df)
+        if df is None or len(df) < 260:
+            return {}
+        try:
+            o = df["open"].to_numpy(float); h = df["high"].to_numpy(float)
+            l = df["low"].to_numpy(float);  c = df["close"].to_numpy(float)
+            cs, v = df["close"], df["volume"]
+            tr = pd.concat([df["high"] - df["low"],
+                            (df["high"] - cs.shift()).abs(),
+                            (df["low"] - cs.shift()).abs()], axis=1).max(axis=1)
+            atr = tr.ewm(span=14, adjust=False).mean().to_numpy(float)
+
+            ema21 = cs.ewm(span=21, adjust=False).mean()
+            ema50 = cs.ewm(span=50, adjust=False).mean()
+            sma200 = cs.rolling(200).mean()
+            d = cs.diff()
+            gain = d.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+            loss = (-d.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+            rsi = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+
+            hh55 = df["high"].rolling(55).max().shift(1)
+            trend = (cs > sma200) & (ema21 > ema50)
+            brk = (cs > hh55) & (v > 1.3 * v.rolling(20).mean())
+            pull = (df["low"] <= ema21 * 1.005) & (cs > ema21) & rsi.between(40, 62)
+            sig = (trend & (brk | pull)).to_numpy()
+
+            n, i, rs = len(df), 200, []
+            while i < n - 2:
+                if not sig[i]:
+                    i += 1
+                    continue
+                entry, dist = o[i + 1], stop_atr * atr[i]
+                if not np.isfinite(dist) or dist <= 0 or entry <= 0:
+                    i += 1
+                    continue
+                stop, target = entry - dist, entry + target_rr * dist
+                j_end = min(n - 1, i + 1 + cls.HORIZON)
+                r, j = None, i + 1
+                for j in range(i + 1, j_end + 1):
+                    if l[j] <= stop:                       # stop first if both touched
+                        r = (min(o[j], stop) - entry) / dist if j > i + 1 else -1.0
+                        break
+                    if h[j] >= target:
+                        r = target_rr
+                        break
+                if r is None:
+                    r = (c[j_end] - entry) / dist
+                    j = j_end
+                rs.append(r - cost_pct * entry / dist)
+                i = j + 1                                  # no overlapping trades
+
+            arr = np.asarray(rs, float)
+            if len(arr) == 0:
+                out = {"n_trades": 0}
+            else:
+                w, lo = arr[arr > 0], arr[arr <= 0]
+                out = {
+                    "n_trades": int(len(arr)),
+                    "win_rate": round(float(len(w) / len(arr)), 4),
+                    "win_rate_lb": round(cls._wilson_lb(len(w), len(arr)), 4),
+                    "avg_win_R": round(float(w.mean()), 3) if len(w) else 0.0,
+                    "avg_loss_R": round(float(-lo.mean()), 3) if len(lo) else 1.0,
+                    "expectancy_R": round(float(arr.mean()), 3),
+                    "profit_factor": round(float(w.sum() / abs(lo.sum())), 2) if len(lo) and lo.sum() != 0 else None,
+                }
+            cls._CACHE[symbol] = (time.time(), out)
+            return out
+        except Exception as e:
+            logger.debug("SignalBacktester %s: %s", symbol, e)
+            return {}
+
+
+# =========================================================
 # PROPOSAL ENGINE
 # =========================================================
 
@@ -5996,6 +6148,10 @@ class ProposalEngine:
                 close * 0.02
             )
 
+            # --- 60-day relative strength vs SPY ---
+            _roc60 = (df["close"].iloc[-1] / df["close"].iloc[-61] - 1) * 100 if len(df) > 61 else 0.0
+            techs["rs_60d"] = _roc60 - float((market_regime.get("SPY") or {}).get("roc_60d", 0) or 0)
+
             # ---------------------------------------------
             # FEATURES
             # ---------------------------------------------
@@ -6069,6 +6225,22 @@ class ProposalEngine:
             elif evt_advice == "HALVE_SIZE":
                 confidence = max(0, confidence - 5)
 
+            # ---- historical edge check ----
+            bt = SignalBacktester.run(symbol, df)
+            bt_n = bt.get("n_trades", 0)
+            if bt_n >= SignalBacktester.MIN_TRADES:
+                if bt["expectancy_R"] < 0:
+                    if bt_n >= 20:
+                        return None                      # negative-expectancy history
+                    confidence = max(0, confidence - 10)
+                elif bt["expectancy_R"] > 0.25 and bt["win_rate_lb"] > 0.36:
+                    confidence = min(100, confidence + 3)
+
+            # ---- hard regime gate ----
+            _ov = market_regime.get("_overall", "NEUTRAL") if market_regime else "NEUTRAL"
+            if _ov in ("BEAR", "STRONG_BEAR") and confidence < 72:
+                return None
+
             if confidence < ProposalEngine.MIN_CONFIDENCE:
                 logger.info(
                     f"[{symbol}] Event-risk penalty pushed confidence to "
@@ -6116,10 +6288,10 @@ class ProposalEngine:
                 market_regime,
                 ai.get("horizon_confidence"),
                 direction=direction,
-                # Enhanced risk parameters (None for now until we have historical data)
-                win_rate=None,
-                avg_win=None,
-                avg_loss=None,
+                # Use backtest statistics for Kelly Criterion when available
+                win_rate=bt.get("win_rate_lb") if bt_n >= SignalBacktester.MIN_TRADES else None,
+                avg_win=bt.get("avg_win_R") if bt_n >= SignalBacktester.MIN_TRADES else None,
+                avg_loss=bt.get("avg_loss_R") if bt_n >= SignalBacktester.MIN_TRADES else None,
                 atr_percentile=techs.get("atr_percentile", 50) / 100.0 if "atr_percentile" in techs else 0.5,
             )
 
@@ -6221,6 +6393,9 @@ class ProposalEngine:
             trailing_stop_activated=trade.get("trailing_stop_activated", False),
             event_risk_score=event_score,
             event_risk_flags=event_flags,
+            bt_win_rate=bt.get("win_rate"),
+            bt_expectancy_R=bt.get("expectancy_R"),
+            bt_trades=bt_n,
             )
 
         except Exception as e:
@@ -8183,6 +8358,9 @@ def main_ui():
                         else:
                             effective = 0
                         if effective >= min_confidence:
+                            # Skip watchlist items from trade list
+                            if getattr(res, "bucket", "") == "Watchlist":
+                                continue
                             proposals.append(res)
 
         progress.empty()
