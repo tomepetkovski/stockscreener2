@@ -252,8 +252,15 @@ _TG_FAIL_TOTAL : int = 0
 _AUTO_SCAN_INTERVAL_HOURS: float = 4.0
 _AUTO_SCAN_INTERVAL_SECS: int   = int(_AUTO_SCAN_INTERVAL_HOURS * 3600)
 _SCAN_WORKERS: int = 8
-_SCAN_TIMEOUT_S: int = 30
+_SCAN_TIMEOUT_S: int = 90
 _MIN_CONFIDENCE: float = 48.0
+
+# Per-(symbol,period,interval) OHLCV cache.  The 4 h auto-scan would otherwise
+# re-download the whole universe every cycle; this keeps one fetch per symbol
+# per 3 h and is what makes repeat scans cheap.
+_DL_CACHE: Dict[Tuple[str, str, str], Tuple[float, Optional[pd.DataFrame]]] = {}
+_DL_LOCK = threading.Lock()
+_DL_TTL_S: int = 10800   # 3 h
 
 # Auto-scan state
 _LAST_SCAN_AT:   Optional[datetime] = None
@@ -1110,7 +1117,18 @@ def _download_timeframe(
     ) -> Optional[pd.DataFrame]:
     """
     Download and normalize OHLCV data for a single timeframe.
+
+    Results are cached for ``_DL_TTL_S`` seconds keyed on (symbol, period,
+    interval).  This is what makes the 4-hour auto-scan repeatable without
+    hammering Yahoo again for every symbol on every cycle.
     """
+    key = (symbol, period, interval)
+    now = time.time()
+    with _DL_LOCK:
+        hit = _DL_CACHE.get(key)
+        if hit and now - hit[0] < _DL_TTL_S:
+            return hit[1].copy() if hit[1] is not None else None
+
     try:
         # `repair=True` can raise KeyError('Stock Splits') on some 1wk payloads.
         # Keep repair only for daily bars where it is most useful.
@@ -1128,29 +1146,31 @@ def _download_timeframe(
             logger.warning(
                 f"No data returned for {symbol} [{interval}]"
             )
-            return None
+            result = None
+        else:
+            df = normalize_ohlcv(df)
 
-        df = normalize_ohlcv(df)
-
-        if df is None or df.empty:
-            logger.warning(
-                f"Normalization failed for {symbol} [{interval}]"
-            )
-            return None
-
-        # Ensure sorted datetime index
-        df = df.sort_index()
-
-        # Remove duplicate candles if any
-        df = df[~df.index.duplicated(keep="last")]
-
-        return df
+            if df is None or df.empty:
+                logger.warning(
+                    f"Normalization failed for {symbol} [{interval}]"
+                )
+                result = None
+            else:
+                # Ensure sorted datetime index
+                df = df.sort_index()
+                # Remove duplicate candles if any
+                df = df[~df.index.duplicated(keep="last")]
+                result = df
 
     except Exception as e:
         logger.exception(
             f"Failed downloading {symbol} [{interval}] : {e}"
         )
-        return None
+        result = None
+
+    with _DL_LOCK:
+        _DL_CACHE[key] = (now, result)
+    return result.copy() if result is not None else None
 
 def fetch_weekly_data(symbol: str) -> Optional[pd.DataFrame]:
 
@@ -2002,6 +2022,26 @@ class BreakoutThresholds:
     min_breakout_score: int = 50
 
 
+@dataclass
+class BreakoutScoringWeights:
+    """Configurable scoring weights for breakout analysis"""
+    base_breakout: float = 35
+    volume_confirmation: float = 25
+    squeeze_bonus: float = 15
+    accumulation_bonus: float = 10
+    obv_divergence: float = 10
+    pattern_bonus: float = 10
+    htf_alignment: float = 10
+    smc_alignment: float = 10
+    retest_good: float = 5
+    retest_acceptable: float = 2
+    retest_failed: float = -5
+    # Additional volume filters
+    volume_zscore_alignment: float = 5
+    volume_trend_bonus: float = 5
+    volume_strength_bonus: float = 3
+
+
 class BreakoutEngine:
     """
     Institutional breakout engine.
@@ -2019,6 +2059,28 @@ class BreakoutEngine:
     """
 
     CONFIG = BreakoutThresholds()
+    SCORING = BreakoutScoringWeights()
+
+    # -----------------------------------------------------
+    # DATA QUALITY VALIDATION
+    # -----------------------------------------------------
+
+    @staticmethod
+    def _validate_data_quality(df: pd.DataFrame) -> bool:
+        """Quick data quality check to avoid wasted computation"""
+        if df is None or len(df) < 60:
+            return False
+        # Check for duplicate timestamps
+        if df.index.duplicated().any():
+            return False
+        # Check for excessive zero volume
+        if (df["volume"] == 0).sum() / len(df) > 0.1:
+            return False
+        # Check for NaN in critical columns
+        critical_cols = ["open", "high", "low", "close", "volume"]
+        if df[critical_cols].isna().any().any():
+            return False
+        return True
 
     # -----------------------------------------------------
     # PUBLIC
@@ -2032,9 +2094,10 @@ class BreakoutEngine:
         df_weekly: Optional[pd.DataFrame] = None,
     ) -> Dict[str, Any]:
 
-        if df is None or len(df) < 60:
+        # Quick data quality check before expensive calculations
+        if not cls._validate_data_quality(df):
             return {
-                "status": "NO_DATA",
+                "status": "INVALID_DATA",
             }
 
         try:
@@ -2091,6 +2154,41 @@ class BreakoutEngine:
             breakout_type = breakout_data["type"]
             breakout_score = breakout_data["score"]
 
+            # Speed optimization: Early exit if no breakout detected
+            if breakout_type is None:
+                return {
+                    "status": "OK",
+                    "breakout_type": None,
+                    "breakout_score": 0,
+                    "confidence": "LOW",
+                    "squeeze_detected": is_squeeze,
+                    "atr_rank": round(float(atr_rank), 3),
+                    "range_high": float(range_high),
+                    "range_low": float(range_low),
+                    "range_width_pct": round(
+                        range_data["consolidation_ratio"] * 100,
+                        2,
+                    ),
+                    "tight_consolidation": range_data["tight"],
+                    "volume_confirmed": volume_data["volume_confirmed"],
+                    "relative_volume": volume_data["relative_volume"],
+                    "is_accumulating": volume_data["is_accumulating"],
+                    "volume_increasing": volume_data.get("volume_increasing", False),
+                    "volume_strength": volume_data.get("volume_strength", 1.0),
+                    "obv_bullish_divergence": volume_data["obv_bullish_div"],
+                    "obv_bearish_divergence": volume_data["obv_bearish_div"],
+                    "volatility_expansion": volume_data["volatility_expansion"],
+                    "pattern": None,
+                    "smc_alignment": False,
+                    "higher_timeframe_alignment": False,
+                    "retest_quality": "NONE",
+                    "pre_breakout": False,
+                    "volume_zscore_aligned": False,
+                    "signal_quality": "WEAK",
+                    "breakout_strength": "UNDEFINED",
+                    "flags": [],
+                }
+
             # =================================================
             # PATTERN DETECTION
             # =================================================
@@ -2139,26 +2237,47 @@ class BreakoutEngine:
             )
 
             # =================================================
+            # VOLUME Z-SCORE ALIGNMENT CHECK
+            # =================================================
+
+            volume_zscore_aligned = cls._check_volume_zscore_alignment(
+                breakout_type,
+                volume_data["volume_zscore"],
+                volume_data["volume_increasing"],
+            )
+
+            # =================================================
             # FINAL COMPOSITE SCORING
             # =================================================
 
             final_score = breakout_score
 
             if pattern_data["pattern"]:
-                final_score += 10
+                final_score += cls.SCORING.pattern_bonus
 
             if htf_alignment:
-                final_score += 10
+                final_score += cls.SCORING.htf_alignment
 
             if smc_alignment:
-                final_score += 10
+                final_score += cls.SCORING.smc_alignment
 
             if retest_quality == "GOOD":
-                final_score += 5
+                final_score += cls.SCORING.retest_good
+            elif retest_quality == "ACCEPTABLE":
+                final_score += cls.SCORING.retest_acceptable
+            elif retest_quality == "FAILED":
+                final_score += cls.SCORING.retest_failed
 
             final_score = min(100, final_score)
 
             confidence = cls._classify_confidence(final_score)
+
+            # Classify breakout strength for position sizing
+            breakout_strength = cls._classify_breakout_strength(
+                final_score,
+                volume_data["relative_volume"],
+                is_squeeze,
+            )
 
             # =================================================
             # FINAL OUTPUT
@@ -2171,6 +2290,7 @@ class BreakoutEngine:
                 "breakout_type": breakout_type,
                 "breakout_score": final_score,
                 "confidence": confidence,
+                "breakout_strength": breakout_strength,
 
                 # Volatility
                 "squeeze_detected": is_squeeze,
@@ -2191,6 +2311,8 @@ class BreakoutEngine:
                 "volume_zscore": volume_data["volume_zscore"],
                 "relative_volume": volume_data["relative_volume"],
                 "is_accumulating": volume_data["is_accumulating"],
+                "volume_increasing": volume_data.get("volume_increasing", False),
+                "volume_strength": volume_data.get("volume_strength", 1.0),
 
                 # OBV
                 "obv_bullish_divergence":
@@ -2215,12 +2337,15 @@ class BreakoutEngine:
                 "volatility_expansion":
                     volume_data["volatility_expansion"],
 
+                "volume_zscore_aligned": volume_zscore_aligned,
+
                 "signal_quality": cls._signal_quality(
                     final_score,
                     volume_data,
                     htf_alignment,
                     smc_alignment,
                 ),
+                "flags": breakout_data.get("flags", []),
             }
 
         except Exception as e:
@@ -2275,17 +2400,11 @@ class BreakoutEngine:
         atr_rank_series: pd.Series,
         threshold: float,
     ) -> int:
-
-        count = 0
-
-        for val in reversed(atr_rank_series.dropna().tolist()):
-
-            if val < threshold:
-                count += 1
-            else:
-                break
-
-        return count
+        """Vectorized consecutive count - O(1) instead of O(n)"""
+        below_threshold = (atr_rank_series < threshold).astype(int)
+        # Cumulative sum from end to find consecutive True values
+        from_end = below_threshold[::-1].cumsum()
+        return int((from_end == from_end.iloc[-1]).sum())
 
     # =====================================================
     # RANGE STRUCTURE
@@ -2343,9 +2462,11 @@ class BreakoutEngine:
             current_volume / (vol_ma20.iloc[-1] + 1e-9)
         )
 
+        # Bug fix: Prevent division by zero in z-score calculation
+        vol_std20_safe = vol_std20.fillna(1e-9).replace(0, 1e-9)
         volume_zscore = (
             (current_volume - vol_ma20.iloc[-1])
-            / (vol_std20.iloc[-1] + 1e-9)
+            / vol_std20_safe.iloc[-1]
         )
 
         volume_confirmed = (
@@ -2390,6 +2511,14 @@ class BreakoutEngine:
             and obv_change < 0
         )
 
+        # Volume trend analysis - check if volume is increasing
+        vol_ma5 = volume.rolling(5).mean()
+        vol_ma10 = volume.rolling(10).mean()
+        volume_increasing = vol_ma5.iloc[-1] > vol_ma10.iloc[-1]
+
+        # Volume strength - how much above recent average
+        vol_strength = (current_volume / vol_ma20.iloc[-1]) if vol_ma20.iloc[-1] > 0 else 1.0
+
         return {
             "volume_confirmed": bool(volume_confirmed),
             "volume_zscore": round(float(volume_zscore), 2),
@@ -2400,6 +2529,8 @@ class BreakoutEngine:
             "volatility_expansion": (
                 volume_zscore > 1.5
             ),
+            "volume_increasing": bool(volume_increasing),
+            "volume_strength": round(float(vol_strength), 2),
         }
 
     # =====================================================
@@ -2419,6 +2550,7 @@ class BreakoutEngine:
 
         score = 0
         breakout_type = None
+        flags = []
 
         buffer = cls.CONFIG.breakout_buffer
 
@@ -2433,37 +2565,72 @@ class BreakoutEngine:
         if bullish_breakout:
 
             breakout_type = "BULLISH_BREAKOUT"
-            score += 35
+            score += cls.SCORING.base_breakout
 
             if volume_data["volume_confirmed"]:
-                score += 25
+                score += cls.SCORING.volume_confirmation
 
             if squeeze:
-                score += 15
+                score += cls.SCORING.squeeze_bonus
 
             if accumulation:
-                score += 10
+                score += cls.SCORING.accumulation_bonus
 
             if volume_data["obv_bullish_div"]:
-                score += 10
+                score += cls.SCORING.obv_divergence
+
+            # Additional filter: z-score direction and volume trend
+            # Bonus if volume z-score is positive (above average) for bullish breakout
+            volume_zscore = volume_data.get("volume_zscore", 0)
+            if volume_zscore > 0:
+                score += cls.SCORING.volume_zscore_alignment  # z-score in same direction as breakout
+                flags.append("VOLUME_ZSCORE_ALIGNED")
+
+            # Bonus if volume is increasing
+            if volume_data.get("volume_increasing", False):
+                score += cls.SCORING.volume_trend_bonus  # volume trend supports breakout
+                flags.append("VOLUME_INCREASING")
+
+            # Additional bonus for strong volume strength (>2x average)
+            if volume_data.get("volume_strength", 1.0) >= 2.0:
+                score += cls.SCORING.volume_strength_bonus  # exceptional volume strength
+                flags.append("STRONG_VOLUME")
 
         elif bearish_breakout:
 
             breakout_type = "BEARISH_BREAKOUT"
-            score += 35
+            score += cls.SCORING.base_breakout
 
             if volume_data["volume_confirmed"]:
-                score += 25
+                score += cls.SCORING.volume_confirmation
 
             if squeeze:
-                score += 15
+                score += cls.SCORING.squeeze_bonus
 
             if volume_data["obv_bearish_div"]:
-                score += 10
+                score += cls.SCORING.obv_divergence
+
+            # Additional filter: z-score direction and volume trend
+            # For bearish, we want to see if volume is elevated but check context
+            volume_zscore = volume_data.get("volume_zscore", 0)
+            if volume_zscore > 0:
+                score += cls.SCORING.volume_zscore_alignment  # elevated volume supports bearish breakdown
+                flags.append("VOLUME_ZSCORE_ALIGNED")
+
+            # Bonus if volume is increasing
+            if volume_data.get("volume_increasing", False):
+                score += cls.SCORING.volume_trend_bonus  # volume trend supports breakdown
+                flags.append("VOLUME_INCREASING")
+
+            # Additional bonus for strong volume strength
+            if volume_data.get("volume_strength", 1.0) >= 2.0:
+                score += cls.SCORING.volume_strength_bonus  # exceptional volume strength
+                flags.append("STRONG_VOLUME")
 
         return {
             "type": breakout_type,
             "score": score,
+            "flags": flags,
         }
 
     # =====================================================
@@ -2484,9 +2651,11 @@ class BreakoutEngine:
         high_std = highs.std()
         high_mean = highs.mean()
 
-        flat_resistance = (
-            high_std / (high_mean + 1e-9)
-        ) < 0.03
+        # Bug fix: Check for NaN before division
+        if pd.isna(high_mean) or high_mean <= 0:
+            flat_resistance = False
+        else:
+            flat_resistance = (high_std / high_mean) < 0.03
 
         rising_lows = (
             lows.iloc[-10:].mean()
@@ -2660,6 +2829,33 @@ class BreakoutEngine:
         )
 
     # =====================================================
+    # VOLUME Z-SCORE ALIGNMENT
+    # =====================================================
+
+    @staticmethod
+    def _check_volume_zscore_alignment(
+        breakout_type: Optional[str],
+        volume_zscore: float,
+        volume_increasing: bool,
+    ) -> bool:
+        """
+        Check if volume z-score and trend align with breakout direction.
+        For both bullish and bearish breakouts, we want to see:
+        - Positive volume z-score (elevated volume)
+        - Increasing volume trend
+        """
+        if breakout_type is None:
+            return False
+
+        # Both breakout types benefit from elevated volume
+        zscore_aligned = volume_zscore > 0
+
+        # Both benefit from increasing volume
+        trend_aligned = volume_increasing
+
+        return zscore_aligned and trend_aligned
+
+    # =====================================================
     # CONFIDENCE
     # =====================================================
 
@@ -2707,6 +2903,25 @@ class BreakoutEngine:
             return "TRADABLE"
 
         return "WEAK"
+
+    # =====================================================
+    # BREAKOUT STRENGTH CLASSIFICATION
+    # =====================================================
+
+    @staticmethod
+    def _classify_breakout_strength(
+        breakout_score: int,
+        volume_multiplier: float,
+        squeeze_detected: bool,
+    ) -> str:
+        """Classify breakout strength for position sizing"""
+        if breakout_score >= 80 and volume_multiplier >= 2.0:
+            return "STRONG"
+        elif breakout_score >= 65 and volume_multiplier >= 1.5:
+            return "MODERATE"
+        elif breakout_score >= 50:
+            return "WEAK"
+        return "UNDEFINED"
 
 
 # ===============================================
@@ -3959,25 +4174,32 @@ class SentimentEngine:
             ticker = yf.Ticker(symbol)
             news = ticker.news
             if not news:
-                return {"score": 50, "label": "NEUTRAL", "headline_count": 0}
+                return {"score": 50, "label": "NEUTRAL", "headline_count": 0, "headlines": []}
 
             score = 50
             headlines = []
+            headline_objects = []
             for item in news[:8]:
                 title = news_title(item)
                 headlines.append(title)
+                # Store original title and link for display
+                headline_objects.append({
+                    "title": item.get("title") or (item.get("content") or {}).get("title") or "",
+                    "link": item.get("link") or "",
+                    "published": item.get("providerPublishTime") or ""
+                })
                 for w in title.split():
                     w_clean = w.strip(".,!?;:\"'()[]{}")
                     if w_clean in SentimentEngine.BULLISH_WORDS:
                         score += SentimentEngine.BULLISH_WORDS[w_clean]
                     if w_clean in SentimentEngine.BEARISH_WORDS:
                         score += SentimentEngine.BEARISH_WORDS[w_clean]
-            
+
             score = float(np.clip(score, 0, 100))
             label = "BULLISH" if score > 60 else "BEARISH" if score < 40 else "NEUTRAL"
-            return {"score": score, "label": label, "headline_count": len(headlines)}
+            return {"score": score, "label": label, "headline_count": len(headlines), "headlines": headline_objects}
         except:
-            return {"score": 50, "label": "NEUTRAL", "headline_count": 0}
+            return {"score": 50, "label": "NEUTRAL", "headline_count": 0, "headlines": []}
 
 
 # ===============================================
@@ -4588,6 +4810,7 @@ class MLPrognosisEngine:
     FORWARD_H = 10
     RET_TH = 0.006
     MIN_SAMPLES = 80  # reduced to ensure training on shorter histories
+    MAX_TRAIN_ROWS = 500  # memory cap: 8 workers × 500 rows × 13 features
     CACHE_SUBDIR = "ml_prognosis_cache"
 
     @classmethod
@@ -4706,6 +4929,10 @@ class MLPrognosisEngine:
         mat = mat.iloc[: -cls.FORWARD_H].dropna()
         if len(mat) < cls.MIN_SAMPLES:
             return None, None
+        # Cap the training frame — keeps memory bounded when 8+ workers train
+        # concurrently on 2y of daily bars.
+        if len(mat) > cls.MAX_TRAIN_ROWS:
+            mat = mat.iloc[-cls.MAX_TRAIN_ROWS:]
         return mat, live
 
     @classmethod
@@ -5131,6 +5358,26 @@ class AnalystConsensusEngine:
 
             score = score_map.get(recommendation, 50)
 
+            # Generate synthetic analyst comments based on recommendation
+            comments = []
+            if analyst_count > 0:
+                if recommendation == "strong_buy":
+                    comments.append(f"Strong bullish outlook with {analyst_count} analysts recommending")
+                    if upside > 20:
+                        comments.append(f"Significant upside potential of {upside:.1f}% to target price")
+                elif recommendation == "buy":
+                    comments.append(f"Bullish consensus with {analyst_count} analysts rating buy")
+                    if upside > 10:
+                        comments.append(f"Expected upside of {upside:.1f}% to mean target")
+                elif recommendation == "overweight":
+                    comments.append(f"Outperform recommendation with {analyst_count} analysts")
+                elif recommendation == "hold":
+                    comments.append(f"Neutral stance with {analyst_count} analysts at hold")
+                elif recommendation == "underperform":
+                    comments.append(f"Caution advised with {analyst_count} analysts rating underperform")
+                elif recommendation == "sell":
+                    comments.append(f"Bearish outlook with {analyst_count} analysts recommending sell")
+
             return {
                 "source": "Yahoo/Nasdaq Aggregated",
                 "recommendation": recommendation.upper(),
@@ -5138,7 +5385,8 @@ class AnalystConsensusEngine:
                 "target_price": target_mean,
                 "current_price": current_price,
                 "upside_pct": round(upside, 2),
-                "score": score
+                "score": score,
+                "comments": comments
             }
 
         except Exception as e:
@@ -5530,6 +5778,20 @@ class InvestmentProposal:
     bt_win_rate: Optional[float] = None
     bt_expectancy_R: Optional[float] = None
     bt_trades: int = 0
+    # Individual analyst commentary
+    analyst_comments: List[str] = field(default_factory=list)
+    piotroski_f: int = 0
+    altman_z: Optional[float] = None
+    # Trailing stop
+    trailing_stop: float = 0.0
+    trailing_stop_activated: bool = False
+    # Event / earnings risk
+    event_risk_score: float = 0.0
+    event_risk_flags: List[str] = field(default_factory=list)
+    # Backtest metrics
+    bt_win_rate: Optional[float] = None
+    bt_expectancy_R: Optional[float] = None
+    bt_trades: int = 0
 
 
 # =========================================================
@@ -5642,9 +5904,24 @@ class MarketScanner:
                         active_caps[sr.cap_tier] = active_caps.get(sr.cap_tier, 0) + 1
                         if progress_fn:
                             progress_fn(sym, "ok", sr.proposal)
+                except FutureTimeout:
+                    # A single hung symbol must not stall the whole scan.
+                    logger.warning(
+                        "[%s] analysis timed out after %ds — skipping",
+                        sym, _SCAN_TIMEOUT_S,
+                    )
+                    self._fetcher_errors[sym] = f"timeout after {_SCAN_TIMEOUT_S}s"
                 except Exception as exc:
                     logger.debug("[%s] analysis error: %s", sym, exc)
                     self._fetcher_errors[sym] = str(exc)
+
+            # Drain any futures that never completed (shouldn't happen with
+            # as_completed, but guards against a worker that hangs past the
+            # timeout on a symbol we already skipped).
+            for fut, sym in fut_map.items():
+                if not fut.done():
+                    logger.warning("[%s] worker still running at scan end — cancelling", sym)
+                    fut.cancel()
 
         logger.info("  Raw results: %d", len(raw_results))
 
@@ -5674,12 +5951,7 @@ class MarketScanner:
             cap_tier = meta.get("cap", "LARGE")
             sector   = meta.get("sector", "—")
 
-            df_daily = safe_yf_download(
-                symbol,
-                period="5y",
-                interval="1d",
-                retries=2,
-            )
+            df_daily = _download_timeframe(symbol, "2y", "1d")
             if df_daily is None or df_daily.empty or len(df_daily) < 60:
                 return None
 
@@ -6313,6 +6585,7 @@ class ProposalEngine:
                 "score": sentiment.get("score"),
                 "label": sentiment.get("label"),
                 "headline_count": sentiment.get("headline_count", 0),
+                "headlines": sentiment.get("headlines", []),
             }
             sector_flow_ctx = ProposalEngine._flow_context(
                 symbol,
@@ -6379,6 +6652,7 @@ class ProposalEngine:
 
                 weights=ai.get("weights", {}),
                 analyst_consensus=analysts,
+                analyst_comments=analysts.get("comments", []),
                 breakout_analytics=breakout_snap,
                 sentiment_snapshot=sentiment_snap,
                 sector_flow=sector_flow_ctx,
@@ -6793,6 +7067,7 @@ class ProposalEngine:
                 "score": sentiment.get("score"),
                 "label": sentiment.get("label"),
                 "headline_count": sentiment.get("headline_count", 0),
+                "headlines": sentiment.get("headlines", []),
             },
             "sector_flow": sector_flow,
             "money_flow_note": money_note,
@@ -7926,7 +8201,6 @@ def main_ui():
     import numpy as np
     import pandas as pd
     import time
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     st.set_page_config(layout="wide", page_title="Institutional Breakout Terminal v4")
 
@@ -8861,27 +9135,38 @@ def main_ui():
 
                 border = "🟢" if is_breakout else "🟡"
 
-                st.markdown(f"## {border} {getattr(p, 'symbol', '—')}")
-                st.markdown(
-                    f"**{getattr(p, 'direction', '—')} | "
-                    f"{setup_label} | "
-                    f"{getattr(p, 'ai_grade', '—')} "
-                    f"({safe(getattr(p, 'ai_confidence', 0))}%)**"
-                )
+                # Main card container
+                with st.container():
+                    st.markdown(f"### {border} {getattr(p, 'symbol', '—')}")
+
+                    # Header row with key info
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a:
+                        st.metric("Direction", getattr(p, 'direction', '—'))
+                    with col_b:
+                        st.metric("Setup Type", setup_label)
+                    with col_c:
+                        st.metric("AI Grade", f"{getattr(p, 'ai_grade', '—')} ({safe(getattr(p, 'ai_confidence', 0))}%)")
+
+                    st.markdown("---")
 
                 # -------------------------
-                # METRICS GRID
+                # TRADE LEVELS SECTION
                 # -------------------------
+                st.markdown("**🎯 Trade Levels**")
                 c1, c2, c3 = st.columns(3)
 
-                c1.metric("Entry", safe(getattr(p, "entry_price", 0)))
-                c2.metric("Stop", safe(getattr(p, "stop_loss", 0)))
-                c3.metric("Size %", safe(getattr(p, "position_size_pct", 0)))
+                c1.metric("Entry", f"${safe(getattr(p, 'entry_price', 0)):.2f}")
+                c2.metric("Stop Loss", f"${safe(getattr(p, 'stop_loss', 0)):.2f}")
+                c3.metric("Position Size", f"{safe(getattr(p, 'position_size_pct', 0)):.1f}%")
 
-                c1.metric("TP2", safe(getattr(p, "tp_2", 0)))
-                c2.metric("TP3", safe(getattr(p, "tp_3", 0)))
-                c3.metric("R:R", f"1:{safe(getattr(p, 'risk_reward', 0))}")
+                c1.metric("Target 1", f"${safe(getattr(p, 'tp_1', 0)):.2f}")
+                c2.metric("Target 2", f"${safe(getattr(p, 'tp_2', 0)):.2f}")
+                c3.metric("Risk:Reward", f"1:{safe(getattr(p, 'risk_reward', 0)):.1f}")
 
+                st.markdown("---")
+
+                st.markdown("**🤖 AI & Order Flow**")
                 ofx = getattr(p, "order_flow", None) or {}
                 mlx = getattr(p, "ml_prognosis", None) or {}
                 o1, o2, o3 = st.columns(3)
@@ -8903,6 +9188,7 @@ def main_ui():
                 _brier = mlx.get("brier_score")
 
                 if any(v is not None for v in [_prec_l, _rec_l, _f1_l, _prec_s, _rec_s, _f1_s, _brier]):
+                    st.markdown("**ML Model Performance**")
                     m1, m2, m3, m4, m5 = st.columns(5)
                     if _prec_l is not None:
                         m1.metric("Prec(L)", f"{_prec_l:.3f}")
@@ -8914,6 +9200,8 @@ def main_ui():
                         m4.metric("Brier", f"{_brier:.3f}")
                     if _prec_s is not None:
                         m5.metric("Prec(S)", f"{_prec_s:.3f}")
+
+                st.markdown("---")
 
                 # Holdout accuracy and feature importance snippet
                 _ho = mlx.get("holdout_accuracy")
@@ -8958,9 +9246,25 @@ def main_ui():
                 )
 
                 # -------------------------
+                # NEWS HEADLINES
+                # -------------------------
+                headlines = _sn.get("headlines", [])
+                if headlines:
+                    with st.expander(f"📰 Latest News ({len(headlines)} headlines)", expanded=False):
+                        for h in headlines[:5]:  # Show top 5 headlines
+                            title = h.get("title", "")
+                            link = h.get("link", "")
+                            if title:
+                                if link:
+                                    st.markdown(f"• [{title}]({link})")
+                                else:
+                                    st.markdown(f"• {title}")
+
+                # -------------------------
                 # ANALYST CONSENSUS
                 # -------------------------
                 analyst_block = getattr(p, "analyst_consensus", None) or {}
+                analyst_comments = getattr(p, "analyst_comments", None) or []
 
                 if analyst_block:
 
@@ -8969,6 +9273,17 @@ def main_ui():
                         f"({safe(analyst_block.get('score', 50)):.1f}) | "
                         f"Coverage: {analyst_block.get('coverage', 0)}%"
                     )
+
+                    # Display analyst summary text if available
+                    summary = analyst_block.get("summary", "")
+                    if summary:
+                        st.info(f"💬 {summary}")
+
+                    # Display analyst comments from the comments field
+                    if analyst_comments:
+                        st.markdown("**📊 Analyst Commentary:**")
+                        for comment in analyst_comments[:3]:  # Show top 3 comments
+                            st.markdown(f"• {comment}")
 
                     with st.expander("Analyst Rating Breakdown", expanded=False):
 
@@ -9000,7 +9315,6 @@ def main_ui():
                                 width="stretch",
                                 hide_index=True
                             )
-                            st.caption(analyst_block.get("summary", ""))
 
                 # -------------------------
                 # CHART (SAFE FIX)
