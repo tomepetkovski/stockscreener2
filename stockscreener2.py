@@ -5780,18 +5780,10 @@ class InvestmentProposal:
     bt_trades: int = 0
     # Individual analyst commentary
     analyst_comments: List[str] = field(default_factory=list)
-    piotroski_f: int = 0
-    altman_z: Optional[float] = None
-    # Trailing stop
-    trailing_stop: float = 0.0
-    trailing_stop_activated: bool = False
-    # Event / earnings risk
-    event_risk_score: float = 0.0
-    event_risk_flags: List[str] = field(default_factory=list)
-    # Backtest metrics
-    bt_win_rate: Optional[float] = None
-    bt_expectancy_R: Optional[float] = None
-    bt_trades: int = 0
+    # Crash protection
+    crash_warning_level: str = "LOW"
+    crash_warning_reasons: List[str] = field(default_factory=list)
+    crash_position_adjustment: float = 1.0
 
 
 # =========================================================
@@ -6317,6 +6309,162 @@ class SignalBacktester:
 
 
 # =========================================================
+# CRASH PROTECTION ENGINE
+# =========================================================
+
+class CrashProtectionEngine:
+    """
+    Crash protection engine for detecting market crash conditions
+    and providing risk warnings to protect against large drawdowns.
+    """
+
+    # Crash warning levels
+    CRITICAL = "CRITICAL"  # 🔴 Avoid new positions
+    HIGH = "HIGH"  # 🟠 Reduce exposure
+    MODERATE = "MODERATE"  # 🟡 Be cautious
+    LOW = "LOW"  # 🟢 Normal
+
+    @staticmethod
+    def assess_crash_risk(
+        market_regime: Dict[str, Any],
+        sector_rotation: Optional[Dict[str, Any]] = None,
+        technical_data: Optional[Dict[str, Any]] = None,
+        order_flow: Optional[Dict[str, Any]] = None,
+        volume_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Assess overall crash risk based on multiple factors.
+        Returns crash warning level and reasons.
+        """
+        warning_level = CrashProtectionEngine.LOW
+        reasons = []
+        position_adjustment = 1.0  # 1.0 = normal, 0.5 = half size, 0.0 = no new positions
+
+        # 1. Market Regime Analysis
+        overall_regime = market_regime.get("_overall", "NEUTRAL") if market_regime else "NEUTRAL"
+        vix = float(market_regime.get("VIX", {}).get("close", 20)) if market_regime else 20
+
+        if overall_regime in ("STRONG_BEAR", "BEAR"):
+            reasons.append(f"Bearish regime: {overall_regime}")
+            warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+            position_adjustment *= 0.7
+
+        if overall_regime == "STRONG_BEAR":
+            reasons.append("Strong bear market detected")
+            warning_level = max(warning_level, CrashProtectionEngine.HIGH)
+            position_adjustment *= 0.5
+
+        if vix > 35:
+            reasons.append(f"Extreme VIX: {vix:.1f}")
+            warning_level = max(warning_level, CrashProtectionEngine.CRITICAL)
+            position_adjustment *= 0.3
+        elif vix > 25:
+            reasons.append(f"Elevated VIX: {vix:.1f}")
+            warning_level = max(warning_level, CrashProtectionEngine.HIGH)
+            position_adjustment *= 0.6
+        elif vix > 20:
+            reasons.append(f"Moderate VIX: {vix:.1f}")
+            warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+            position_adjustment *= 0.8
+
+        # 2. Market Breadth Analysis
+        breadth = market_regime.get("market_breadth", {}) if market_regime else {}
+        breadth_pct = float(breadth.get("pct_above_ma", 50)) if breadth else 50
+
+        if breadth_pct < 15:
+            reasons.append(f"Extreme market weakness: {breadth_pct:.1f}% above MA")
+            warning_level = max(warning_level, CrashProtectionEngine.CRITICAL)
+            position_adjustment *= 0.2
+        elif breadth_pct < 25:
+            reasons.append(f"Weak market breadth: {breadth_pct:.1f}% above MA")
+            warning_level = max(warning_level, CrashProtectionEngine.HIGH)
+            position_adjustment *= 0.5
+        elif breadth_pct < 40:
+            reasons.append(f"Declining market breadth: {breadth_pct:.1f}% above MA")
+            warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+            position_adjustment *= 0.8
+
+        # 3. Technical Analysis
+        if technical_data:
+            price_below_200ma = technical_data.get("price_below_200ma", False)
+            rsi = float(technical_data.get("rsi", 50))
+            atr_expansion = technical_data.get("atr_expansion", False)
+
+            if price_below_200ma:
+                reasons.append("Price below 200-day MA")
+                warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+                position_adjustment *= 0.8
+
+            if rsi < 30:
+                reasons.append(f"Oversold RSI: {rsi:.1f}")
+                warning_level = max(warning_level, CrashProtectionEngine.HIGH)
+                position_adjustment *= 0.6
+
+            if atr_expansion:
+                reasons.append("ATR expansion (high volatility)")
+                warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+                position_adjustment *= 0.8
+
+        # 4. Order Flow Analysis
+        if order_flow:
+            of_bias = order_flow.get("of_bias", "")
+            if of_bias == "BEARISH":
+                reasons.append("Bearish order flow bias")
+                warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+                position_adjustment *= 0.8
+
+        # 5. Volume Analysis
+        if volume_data:
+            obv_bearish_div = volume_data.get("obv_bearish_div", False)
+            if obv_bearish_div:
+                reasons.append("OBV bearish divergence")
+                warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+                position_adjustment *= 0.8
+
+        # Final adjustment based on warning level
+        if warning_level == CrashProtectionEngine.CRITICAL:
+            position_adjustment = 0.0  # No new positions
+        elif warning_level == CrashProtectionEngine.HIGH:
+            position_adjustment = min(position_adjustment, 0.5)
+        elif warning_level == CrashProtectionEngine.MODERATE:
+            position_adjustment = min(position_adjustment, 0.7)
+
+        return {
+            "warning_level": warning_level,
+            "reasons": reasons,
+            "position_adjustment": round(position_adjustment, 2),
+            "vix": vix,
+            "breadth_pct": breadth_pct,
+            "regime": overall_regime,
+        }
+
+    @staticmethod
+    def get_crash_emoji(level: str) -> str:
+        """Get emoji for crash warning level"""
+        emoji_map = {
+            CrashProtectionEngine.CRITICAL: "🔴",
+            CrashProtectionEngine.HIGH: "🟠",
+            CrashProtectionEngine.MODERATE: "🟡",
+            CrashProtectionEngine.LOW: "🟢",
+        }
+        return emoji_map.get(level, "⚪")
+
+    @staticmethod
+    def format_crash_warning(crash_data: Dict[str, Any]) -> str:
+        """Format crash warning for display"""
+        level = crash_data.get("warning_level", "LOW")
+        emoji = CrashProtectionEngine.get_crash_emoji(level)
+        reasons = crash_data.get("reasons", [])
+        adj = crash_data.get("position_adjustment", 1.0)
+
+        if level == CrashProtectionEngine.LOW:
+            return f"{emoji} Market conditions normal (adjustment: {adj:.0%})"
+
+        reason_str = "; ".join(reasons[:3])  # Show top 3 reasons
+        return f"{emoji} {level} RISK: {reason_str} (position adjustment: {adj:.0%})"
+
+
+# =========================================================
 # PROPOSAL ENGINE
 # =========================================================
 
@@ -6407,6 +6555,34 @@ class ProposalEngine:
             ) or {}
 
             # ---------------------------------------------
+            # FEATURES (order flow needs to be before crash protection)
+            # ---------------------------------------------
+
+            order_flow_ctx: Dict[str, Any] = {}
+            if use_order_flow:
+                order_flow_ctx = OrderFlowEngine.analyze(df)
+
+            ml_forecast: Dict[str, Any] = {}
+            if use_ml:
+                ml_forecast = MLPrognosisEngine.forecast(
+                    symbol,
+                    df,
+                    force_retrain=force_ml_retrain,
+                )
+
+            # ---------------------------------------------
+            # CRASH PROTECTION ASSESSMENT
+            # ---------------------------------------------
+
+            crash_protection = CrashProtectionEngine.assess_crash_risk(
+                market_regime=market_regime,
+                sector_rotation=sector_rotation,
+                technical_data=techs,
+                order_flow=order_flow_ctx if use_order_flow else None,
+                volume_data=breakout if breakout else None,
+            )
+
+            # ---------------------------------------------
             # CORE PRICING
             # ---------------------------------------------
 
@@ -6423,22 +6599,6 @@ class ProposalEngine:
             # --- 60-day relative strength vs SPY ---
             _roc60 = (df["close"].iloc[-1] / df["close"].iloc[-61] - 1) * 100 if len(df) > 61 else 0.0
             techs["rs_60d"] = _roc60 - float((market_regime.get("SPY") or {}).get("roc_60d", 0) or 0)
-
-            # ---------------------------------------------
-            # FEATURES
-            # ---------------------------------------------
-
-            order_flow_ctx: Dict[str, Any] = {}
-            if use_order_flow:
-                order_flow_ctx = OrderFlowEngine.analyze(df)
-
-            ml_forecast: Dict[str, Any] = {}
-            if use_ml:
-                ml_forecast = MLPrognosisEngine.forecast(
-                    symbol,
-                    df,
-                    force_retrain=force_ml_retrain,
-                )
 
             features = ProposalEngine._build_features(
                 techs,
@@ -6567,6 +6727,23 @@ class ProposalEngine:
                 atr_percentile=techs.get("atr_percentile", 50) / 100.0 if "atr_percentile" in techs else 0.5,
             )
 
+            # Apply crash protection adjustment to position size
+            crash_adj = crash_protection.get("position_adjustment", 1.0)
+            crash_level = crash_protection.get("warning_level", "LOW")
+
+            # Reject new positions if crash level is CRITICAL
+            if crash_level == CrashProtectionEngine.CRITICAL:
+                logger.warning(
+                    f"[{symbol}] Trade rejected due to CRITICAL crash risk level"
+                )
+                return None
+
+            if crash_adj < 1.0:
+                pos_size *= crash_adj
+                logger.info(
+                    f"[{symbol}] Crash protection applied: {crash_adj:.0%} adjustment"
+                )
+
             # ---------------------------------------------
             # THESIS
             # ---------------------------------------------
@@ -6577,7 +6754,8 @@ class ProposalEngine:
                 techs,
                 funds,
                 ai,
-                analysts
+                analysts,
+                crash_protection=crash_protection
             )
 
             breakout_snap = ProposalEngine._breakout_snapshot(breakout)
@@ -6670,6 +6848,9 @@ class ProposalEngine:
             bt_win_rate=bt.get("win_rate"),
             bt_expectancy_R=bt.get("expectancy_R"),
             bt_trades=bt_n,
+            crash_warning_level=crash_protection.get("warning_level", "LOW"),
+            crash_warning_reasons=crash_protection.get("reasons", []),
+            crash_position_adjustment=crash_protection.get("position_adjustment", 1.0),
             )
 
         except Exception as e:
@@ -7343,20 +7524,44 @@ class ProposalEngine:
         techs,
         funds,
         ai,
-        analysts
+        analysts,
+        crash_protection=None
     ):
 
         thesis = []
 
         thesis.append(setup_type)
 
+        # Breakout analysis with potential and continuation
         if breakout.get("breakout_type"):
-            thesis.append(
-                breakout["breakout_type"]
-            )
+            thesis.append(breakout["breakout_type"])
+
+            # Add breakout potential assessment
+            breakout_score = breakout.get("breakout_score", 0)
+            if breakout_score >= 80:
+                thesis.append("Strong breakout potential with high conviction")
+            elif breakout_score >= 65:
+                thesis.append("Moderate breakout potential")
+            elif breakout_score >= 50:
+                thesis.append("Weak breakout potential")
+
+            # Add continuation signals
+            flags = breakout.get("flags", [])
+            if "VOLUME_ZSCORE_ALIGNED" in flags:
+                thesis.append("Volume z-score aligned for continuation")
+            if "VOLUME_INCREASING" in flags:
+                thesis.append("Volume trend supports continuation")
+            if "STRONG_VOLUME" in flags:
+                thesis.append("Exceptional volume strength supports breakout")
+
+            # Check for sustainability
+            if breakout.get("sustainability", {}).get("sustained"):
+                thesis.append("Breakout sustained with strong follow-through")
+            elif breakout.get("volatility_expansion"):
+                thesis.append("Volatility expansion detected")
 
         if techs.get("golden_cross"):
-            thesis.append("Golden Cross")
+            thesis.append("Golden Cross pattern")
 
         if breakout.get("is_accumulating"):
             thesis.append("Institutional accumulation")
@@ -7373,6 +7578,14 @@ class ProposalEngine:
             thesis.append(
                 f"Earnings growth {growth}%"
             )
+
+        # Crash protection warning
+        if crash_protection:
+            crash_level = crash_protection.get("warning_level", "LOW")
+            if crash_level != "LOW":
+                reasons = crash_protection.get("reasons", [])
+                if reasons:
+                    thesis.append(f"⚠️ CRASH WARNING: {'; '.join(reasons[:2])}")
 
         return ". ".join(thesis) + "."
 
@@ -9151,6 +9364,72 @@ def main_ui():
                     st.markdown("---")
 
                 # -------------------------
+                # SAFE META EXTRACTION (moved up for breakout analysis)
+                # -------------------------
+                _sf = getattr(p, "sector_flow", None) or {}
+                _sn = getattr(p, "sentiment_snapshot", None) or {}
+                _ba = getattr(p, "breakout_analytics", None) or {}
+
+                # -------------------------
+                # CRASH PROTECTION WARNING
+                # -------------------------
+                crash_level = getattr(p, "crash_warning_level", "LOW")
+                crash_reasons = getattr(p, "crash_warning_reasons", [])
+                crash_adj = getattr(p, "crash_position_adjustment", 1.0)
+
+                if crash_level != "LOW":
+                    emoji = CrashProtectionEngine.get_crash_emoji(crash_level)
+                    st.warning(
+                        f"{emoji} **{crash_level} CRASH WARNING**\n\n"
+                        f"Reasons: {'; '.join(crash_reasons[:3])}\n"
+                        f"Position adjustment: {crash_adj:.0%}"
+                    )
+                else:
+                    st.success(f"🟢 Market conditions normal")
+
+                # -------------------------
+                # BREAKOUT POTENTIAL & CONTINUATION
+                # -------------------------
+                breakout_flags = _ba.get("flags", [])
+                breakout_score = _ba.get("breakout_score", 0)
+                breakout_type = _ba.get("breakout_type", "")
+
+                if breakout_type and breakout_score > 0:
+                    st.markdown("**🚀 Breakout Analysis**")
+                    st.caption(f"Type: {breakout_type} | Score: {breakout_score}")
+
+                    # Breakout potential
+                    if breakout_score >= 80:
+                        st.success("✅ Strong breakout potential with high conviction")
+                    elif breakout_score >= 65:
+                        st.info("📊 Moderate breakout potential")
+                    elif breakout_score >= 50:
+                        st.warning("⚠️ Weak breakout potential")
+
+                    # Continuation signals
+                    if breakout_flags:
+                        continuation_signals = []
+                        if "VOLUME_ZSCORE_ALIGNED" in breakout_flags:
+                            continuation_signals.append("✅ Volume z-score aligned")
+                        if "VOLUME_INCREASING" in breakout_flags:
+                            continuation_signals.append("✅ Volume trend supports continuation")
+                        if "STRONG_VOLUME" in breakout_flags:
+                            continuation_signals.append("✅ Exceptional volume strength")
+
+                        if continuation_signals:
+                            st.markdown("**Continuation Signals:**")
+                            for signal in continuation_signals:
+                                st.caption(signal)
+
+                    # Sustainability check
+                    if _ba.get("sustainability", {}).get("sustained"):
+                        st.success("✅ Breakout sustained with strong follow-through")
+                    elif _ba.get("volatility_expansion"):
+                        st.info("📈 Volatility expansion detected")
+
+                    st.markdown("---")
+
+                # -------------------------
                 # TRADE LEVELS SECTION
                 # -------------------------
                 st.markdown("**🎯 Trade Levels**")
@@ -9226,13 +9505,6 @@ def main_ui():
                     sorted_feats = sorted(feat_imp.items(), key=lambda x: x[1], reverse=True)[:5]
                     if sorted_feats:
                         st.caption("Top 5 ML features: " + ", ".join([f"{k} ({v:.3f})" for k,v in sorted_feats]))
-
-                # -------------------------
-                # SAFE META EXTRACTION
-                # -------------------------
-                _sf = getattr(p, "sector_flow", None) or {}
-                _sn = getattr(p, "sentiment_snapshot", None) or {}
-                _ba = getattr(p, "breakout_analytics", None) or {}
 
                 st.caption(
                     f"⚡ Short-term edge: **{safe(getattr(p, 'short_term_score', 0)):.1f}** · "
