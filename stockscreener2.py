@@ -7776,51 +7776,77 @@ class ProposalEngine:
         df,
         market_regime=None,  # NEW: pass market regime
     ):
-        # Use Enhanced Risk Manager for adaptive stop loss
-        regime = market_regime.get("_overall", "NEUTRAL") if market_regime else "NEUTRAL"
-        
-        # Calculate trend strength from breakout score
-        trend_strength = breakout.get("breakout_score", 50) / 100.0
-        
-        stop_result = EnhancedRiskManager.calculate_adaptive_stop_loss(
-            close=close,
-            atr=atr,
-            direction=direction,
-            regime=regime,
-            trend_strength=trend_strength,
-        )
-        
-        sl = stop_result["stop_loss"]
-        
-        # Calculate optimized take profits
-        tp_result = EnhancedRiskManager.optimize_take_profits(
-            entry=close,
-            stop_loss=sl,
-            direction=direction,
-            atr=atr,
-            regime=regime,
-        )
-        
-        # Calculate trailing stop
-        trl_result = EnhancedRiskManager.calculate_trailing_stop(
-            df=df,
-            direction=direction,
-            atr=atr,
-        )
-        
-        setup_type = f"{direction}_SWING"
-        
-        return {
-            "sl": sl,
-            "tp1": tp_result["tp1"],
-            "tp2": tp_result["tp2"],
-            "tp3": tp_result["tp3"],
-            "trailing_stop": trl_result["trailing_stop"],
-            "trailing_stop_activated": trl_result["activated"],
-            "setup_type": setup_type,
-            "atr_multiplier": stop_result["atr_multiplier"],
-            "risk_pct": stop_result["risk_pct"],
-        }
+        try:
+            # Use Enhanced Risk Manager for adaptive stop loss
+            regime = market_regime.get("_overall", "NEUTRAL") if market_regime else "NEUTRAL"
+
+            # Calculate trend strength from breakout score
+            trend_strength = breakout.get("breakout_score", 50) / 100.0
+
+            stop_result = EnhancedRiskManager.calculate_adaptive_stop_loss(
+                close=close,
+                atr=atr,
+                direction=direction,
+                regime=regime,
+                trend_strength=trend_strength,
+            )
+
+            sl = stop_result["stop_loss"]
+
+            # Calculate optimized take profits
+            tp_result = EnhancedRiskManager.optimize_take_profits(
+                entry=close,
+                stop_loss=sl,
+                direction=direction,
+                atr=atr,
+                regime=regime,
+            )
+
+            # Calculate trailing stop
+            trl_result = EnhancedRiskManager.calculate_trailing_stop(
+                df=df,
+                direction=direction,
+                atr=atr,
+            )
+
+            setup_type = f"{direction}_SWING"
+
+            return {
+                "sl": sl,
+                "tp1": tp_result["tp1"],
+                "tp2": tp_result["tp2"],
+                "tp3": tp_result["tp3"],
+                "trailing_stop": trl_result["trailing_stop"],
+                "trailing_stop_activated": trl_result["activated"],
+                "setup_type": setup_type,
+                "atr_multiplier": stop_result.get("atr_multiplier", 1.5),
+                "risk_pct": stop_result.get("risk_pct", 2.0),
+            }
+        except Exception as e:
+            logger.warning(f"EnhancedRiskManager failed, using fallback: {e}")
+            # Fallback to simple calculation
+            if direction == "LONG":
+                sl = close - (atr * 1.5)
+                tp1 = close + (atr * 2.0)
+                tp2 = close + (atr * 3.5)
+                tp3 = close + (atr * 5.0)
+            else:
+                sl = close + (atr * 1.5)
+                tp1 = close - (atr * 2.0)
+                tp2 = close - (atr * 3.5)
+                tp3 = close - (atr * 5.0)
+
+            return {
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "tp3": tp3,
+                "trailing_stop": 0.0,
+                "trailing_stop_activated": False,
+                "setup_type": f"{direction}_SWING",
+                "atr_multiplier": 1.5,
+                "risk_pct": 2.0,
+            }
 
     @staticmethod
     def _calculate_rr(close, sl, target):
