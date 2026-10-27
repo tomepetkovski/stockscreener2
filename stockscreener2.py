@@ -9993,8 +9993,8 @@ def main_ui():
 
                     # Probability metrics
                     if mc_p_tp:
-                        for i, p in enumerate(mc_p_tp):
-                            st.caption(f"P(TP{i+1}) before SL: {p*100:.0f}%")
+                        for _i, _prob in enumerate(mc_p_tp):
+                            st.caption(f"P(TP{_i+1}) before SL: {_prob*100:.0f}%")
 
                     if mc_p_sl > 0:
                         st.caption(f"P(SL before any TP): {mc_p_sl*100:.0f}%")
