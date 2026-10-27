@@ -29,7 +29,7 @@ import re
 import time
 import json
 from typing import Dict, Any, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeout
 import os
 import numpy as np
 import math
@@ -492,7 +492,21 @@ class TelegramNotifier:
                 try: return f"{float(v):.{dp}f}"
                 except Exception: return str(v) if v is not None else "N/A"
 
-            tp1_s, tp2_s, tp3_s = fmt(getattr(p,"tp_1",0)), fmt(getattr(p,"tp_2",0)), fmt(getattr(p,"tp_3",0))
+            def price(v):
+                """Format a dollar price; 'N/A' when missing/NaN/zero."""
+                if v is None:
+                    return "N/A"
+                try:
+                    f = float(v)
+                except (TypeError, ValueError):
+                    return "N/A"
+                if not math.isfinite(f) or f <= 0:
+                    return "N/A"
+                return f"{f:.2f}"
+
+            tp1_s, tp2_s, tp3_s = price(getattr(p,"tp_1",None)), price(getattr(p,"tp_2",None)), price(getattr(p,"tp_3",None))
+            entry_s = price(getattr(p,"entry_price",None))
+            sl_s = price(getattr(p,"stop_loss",None))
             rr_lbl   = f"{safe_num(getattr(p,'risk_reward',1)):.1f}:1"
             rr_ext   = f"{safe_num(getattr(p,'risk_reward_extended',1)):.1f}:1"
             conff    = f"{safe_num(getattr(p,'ai_confidence',0)):.0f}%"
@@ -512,10 +526,9 @@ class TelegramNotifier:
             block = [
                 f"<b>#{rank}  {sym}</b>  {emoji_dir}",
                 "",
-                f"💰 <b>Entry:</b>  <code>{fmt(getattr(p,'entry_price',0))}</code>",
-                f"🛑 <b>Stop Loss:</b> <code>{fmt(getattr(p,'stop_loss',0))}</code>",
+                f"💰 <b>Entry:</b>  <code>{entry_s}</code>",
+                f"🛑 <b>Stop Loss:</b> <code>{sl_s}</code>",
                 f"🎯 <b>TP1:</b> <code>{tp1_s}</code>  <b>TP2:</b> <code>{tp2_s}</code>  <b>TP3:</b> <code>{tp3_s}</code>",
-                f"📊 <b>RR:</b> {rr_lbl} (ext: {rr_ext})",
                 f"⭐ <b>Grade:</b> {grade_emoji}  {grade}  ({conff})",
                 f"📰 <b>Analysts:</b> {ac_label} ({ac_score})",
                 f"⏱ <b>Hold:</b> {hold_per}",
@@ -9115,6 +9128,30 @@ def main_ui():
     def safe_str(x):
         return str(x) if x is not None else ""
 
+    def fmt_price(x, default="—"):
+        """Format a dollar price; render ``default`` when the value is missing/NaN/zero."""
+        if x is None:
+            return default
+        try:
+            f = float(x)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(f) or f <= 0:
+            return default
+        return f"${f:.2f}"
+
+    def fmt_num(x, default="—"):
+        """Format a numeric metric; render ``default`` when missing/NaN."""
+        if x is None:
+            return default
+        try:
+            f = float(x)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(f):
+            return default
+        return f"{f}"
+
     # =========================================================
     # MAIN SCAN BUTTON
     # =========================================================
@@ -9777,10 +9814,10 @@ def main_ui():
                 "Piotroski F": safe(getattr(p, "piotroski_f", 0)),
                 "Altman Z": round(getattr(p, "altman_z", np.nan), 2) if getattr(p, "altman_z", None) is not None else np.nan,
 
-                "Entry": safe(getattr(p, "entry_price", 0)),
-                "SL": safe(getattr(p, "stop_loss", 0)),
-                "TP2": safe(getattr(p, "tp_2", 0)),
-                "TP3": safe(getattr(p, "tp_3", 0)),
+                "Entry": fmt_price(getattr(p, "entry_price", None)),
+                "SL": fmt_price(getattr(p, "stop_loss", None)),
+                "TP2": fmt_price(getattr(p, "tp_2", None)),
+                "TP3": fmt_price(getattr(p, "tp_3", None)),
 
                 "R:R": safe(getattr(p, "risk_reward", 0)),
             })
@@ -9974,12 +10011,12 @@ def main_ui():
                 st.markdown("**🎯 Trade Levels**")
                 c1, c2, c3 = st.columns(3)
 
-                c1.metric("Entry", f"${safe(getattr(p, 'entry_price', 0)):.2f}")
-                c2.metric("Stop Loss", f"${safe(getattr(p, 'stop_loss', 0)):.2f}")
+                c1.metric("Entry", fmt_price(getattr(p, 'entry_price', None)))
+                c2.metric("Stop Loss", fmt_price(getattr(p, 'stop_loss', None)))
                 c3.metric("Position Size", f"{safe(getattr(p, 'position_size_pct', 0)):.1f}%")
 
-                c1.metric("Target 1", f"${safe(getattr(p, 'tp_1', 0)):.2f}")
-                c2.metric("Target 2", f"${safe(getattr(p, 'tp_2', 0)):.2f}")
+                c1.metric("Target 1", fmt_price(getattr(p, 'tp_1', None)))
+                c2.metric("Target 2", fmt_price(getattr(p, 'tp_2', None)))
                 c3.metric("Risk:Reward", f"1:{safe(getattr(p, 'risk_reward', 0)):.1f}")
 
                 st.markdown("---")
