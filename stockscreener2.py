@@ -6800,6 +6800,16 @@ class ProposalEngine:
         force_ml_retrain: bool = False,
         use_mtf_ema: bool = False,
         use_monte_carlo: bool = False,
+        # MTF EMA parameters
+        mtf_fast_mode: bool = True,
+        mtf_max_dist: float = 0.0,
+        # Monte Carlo parameters
+        mc_horizon: int = 60,
+        mc_paths: int = 5000,
+        mc_include_drift: bool = True,
+        mc_sl_mode: str = "ATR",
+        mc_atr_mult: float = 2.0,
+        mc_rr: str = "1,2,3",
     ) -> Optional[InvestmentProposal]:
 
         try:
@@ -6919,9 +6929,9 @@ class ProposalEngine:
                     rules=MTFEMAEngine.DEFAULT_RULES,
                     lf=50,
                     ls=200,
-                    max_dist=0.0,
+                    max_dist=mtf_max_dist,
                     live=True,
-                    fast=True,
+                    fast=mtf_fast_mode,
                 )
                 # Apply MTF EMA filter: reject if not MATCH or WATCH
                 if mtf_ema_result.get("status") not in ("MATCH", "WATCH"):
@@ -7117,12 +7127,19 @@ class ProposalEngine:
             mc_result = {}
             if use_monte_carlo:
                 try:
+                    # Parse RR string
+                    try:
+                        rr_list = [float(x.strip()) for x in mc_rr.split(",")][:3]
+                        assert len(rr_list) == 3 and all(x > 0 for x in rr_list)
+                    except Exception:
+                        rr_list = [1.0, 2.0, 3.0]
+
                     entry, sl, tps, risk = MonteCarloEngine.trade_plan(
-                        df, direction, "ATR", 2.0, [1.0, 2.0, 3.0]
+                        df, direction, mc_sl_mode, mc_atr_mult, rr_list
                     )
                     mc_result = MonteCarloEngine.simulate(
-                        df["close"].values, entry, sl, tps, [1.0, 2.0, 3.0],
-                        direction == "LONG", horizon=60, n_paths=5000, drift=True
+                        df["close"].values, entry, sl, tps, rr_list,
+                        direction == "LONG", horizon=mc_horizon, n_paths=mc_paths, drift=mc_include_drift
                     )
                 except Exception as e:
                     logger.warning(f"[{symbol}] Monte Carlo failed: {e}")
@@ -8877,6 +8894,83 @@ def main_ui():
         value=False,
     )
 
+    # -------------------------
+    # MTF EMA & MONTE CARLO
+    # -------------------------
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔬 Advanced Analysis")
+
+    use_mtf_ema = st.sidebar.checkbox(
+        "MTF EMA Filter (Multi-Timeframe)",
+        value=False,
+        help="Analyzes EMA50/EMA200 across 5 timeframes (15m, 1h, 4h, 1d, 1w). Only MATCH or WATCH symbols pass."
+    )
+
+    use_monte_carlo = st.sidebar.checkbox(
+        "Monte Carlo Simulation",
+        value=False,
+        help="Simulates 5000 price paths to estimate probability of hitting targets/stop-loss and expected value."
+    )
+
+    # MTF EMA Settings (expanded when enabled)
+    if use_mtf_ema:
+        with st.sidebar.expander("MTF EMA Settings", expanded=False):
+            mtf_fast_mode = st.sidebar.checkbox(
+                "Fast Mode (stop after 2 failed TFs)",
+                value=True,
+                help="Stops scanning after 2 failed timeframes to save time. Results are identical for MATCH/WATCH."
+            )
+            mtf_max_dist = st.sidebar.slider(
+                "Max distance from EMA (%)",
+                min_value=0.0,
+                max_value=10.0,
+                value=0.0,
+                step=0.5,
+                help="Maximum allowed percentage distance from EMA. 0 = disabled."
+            )
+
+    # Monte Carlo Settings (expanded when enabled)
+    if use_monte_carlo:
+        with st.sidebar.expander("Monte Carlo Settings", expanded=False):
+            mc_horizon = st.sidebar.slider(
+                "Simulation Horizon (bars)",
+                min_value=10,
+                max_value=200,
+                value=60,
+                step=5,
+                help="Number of bars to simulate forward."
+            )
+            mc_paths = st.sidebar.select_slider(
+                "Number of Paths",
+                options=[1000, 2000, 5000, 10000],
+                value=5000,
+                help="More paths = more accurate but slower."
+            )
+            mc_include_drift = st.sidebar.checkbox(
+                "Include Historical Drift",
+                value=True,
+                help="Include historical drift in the simulation (mean return)."
+            )
+            mc_sl_mode = st.sidebar.selectbox(
+                "Stop-Loss Mode",
+                ["ATR", "Swing (10 bars)"],
+                index=0,
+                help="ATR uses ATR multiple, Swing uses 10-bar high/low."
+            )
+            mc_atr_mult = st.sidebar.slider(
+                "ATR Multiple",
+                min_value=0.5,
+                max_value=5.0,
+                value=2.0,
+                step=0.25,
+                help="ATR multiplier for stop-loss distance."
+            )
+            mc_rr = st.sidebar.text_input(
+                "Take-Profit in R (TP1,TP2,TP3)",
+                value="1,2,3",
+                help="Risk multiples for take-profit levels."
+            )
+
     # ── Auto-Scan (Telegram alerts every 4 h when enabled) ───────────────────
     st.sidebar.markdown("---")
     st.sidebar.subheader("📡 Auto-Scan (Telegram)")
@@ -9082,6 +9176,16 @@ def main_ui():
                     use_order_flow=use_order_flow,
                     use_ml=use_ml,
                     force_ml_retrain=force_ml_retrain,
+                    use_mtf_ema=use_mtf_ema,
+                    use_monte_carlo=use_monte_carlo,
+                    mtf_fast_mode=mtf_fast_mode if use_mtf_ema else True,
+                    mtf_max_dist=mtf_max_dist if use_mtf_ema else 0.0,
+                    mc_horizon=mc_horizon if use_monte_carlo else 60,
+                    mc_paths=mc_paths if use_monte_carlo else 5000,
+                    mc_include_drift=mc_include_drift if use_monte_carlo else True,
+                    mc_sl_mode=mc_sl_mode if use_monte_carlo else "ATR",
+                    mc_atr_mult=mc_atr_mult if use_monte_carlo else 2.0,
+                    mc_rr=mc_rr if use_monte_carlo else "1,2,3",
                 )
                 if prop:
                     sf = prop.sector_flow or {}
@@ -9782,6 +9886,59 @@ def main_ui():
                         st.success("✅ Breakout sustained with strong follow-through")
                     elif _ba.get("volatility_expansion"):
                         st.info("📈 Volatility expansion detected")
+
+                    st.markdown("---")
+
+                # -------------------------
+                # MTF EMA ANALYSIS
+                # -------------------------
+                mtf_status = getattr(p, "mtf_ema_status", "NOT_ANALYZED")
+                mtf_score = getattr(p, "mtf_ema_score", 0.0)
+                mtf_timeframes = getattr(p, "mtf_ema_timeframes", {})
+
+                if mtf_status != "NOT_ANALYZED":
+                    st.markdown("**📊 MTF EMA Analysis**")
+                    if mtf_status == "MATCH":
+                        st.success(f"✅ {mtf_status} (Score: {mtf_score:.1%})")
+                    elif mtf_status == "WATCH":
+                        st.warning(f"👀 {mtf_status} (Score: {mtf_score:.1%})")
+                    else:
+                        st.error(f"❌ {mtf_status} (Score: {mtf_score:.1%})")
+
+                    # Show timeframe breakdown
+                    if mtf_timeframes:
+                        with st.expander("Timeframe Breakdown", expanded=False):
+                            for tf, data in mtf_timeframes.items():
+                                if data.get("status") == "OK":
+                                    passed = "✅" if data.get("passed") else "❌"
+                                    st.caption(f"{tf}: {passed} | Dist 50: {data.get('dist_50', 0):.2f}% | Dist 200: {data.get('dist_200', 0):.2f}%")
+
+                    st.markdown("---")
+
+                # -------------------------
+                # MONTE CARLO SIMULATION
+                # -------------------------
+                mc_p_tp = getattr(p, "mc_p_tp", [])
+                mc_p_sl = getattr(p, "mc_p_sl", 0.0)
+                mc_ev_r = getattr(p, "mc_ev_r", 0.0)
+                mc_exp_price = getattr(p, "mc_exp_price", 0.0)
+                mc_median = getattr(p, "mc_median", 0.0)
+
+                if mc_p_tp or mc_p_sl > 0:
+                    st.markdown("**🎲 Monte Carlo Simulation**")
+                    st.caption(f"Expected Value: {mc_ev_r:+.2f}R")
+
+                    # Probability metrics
+                    if mc_p_tp:
+                        for i, p in enumerate(mc_p_tp):
+                            st.caption(f"P(TP{i+1}) before SL: {p*100:.0f}%")
+
+                    if mc_p_sl > 0:
+                        st.caption(f"P(SL before any TP): {mc_p_sl*100:.0f}%")
+
+                    # Price distribution
+                    st.caption(f"Expected Price: ${mc_exp_price:.2f} | Median: ${mc_median:.2f}")
+                    st.caption(f"Range (5-95%): ${getattr(p, 'mc_p5', 0):.2f} - ${getattr(p, 'mc_p95', 0):.2f}")
 
                     st.markdown("---")
 
