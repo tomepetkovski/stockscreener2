@@ -7967,7 +7967,8 @@ class ProposalEngine:
                 thesis.append("Exceptional volume strength supports breakout")
 
             # Check for sustainability
-            if breakout.get("sustainability", {}).get("sustained"):
+            _sus = breakout.get("sustainability", {})
+            if isinstance(_sus, dict) and _sus.get("sustained"):
                 thesis.append("Breakout sustained with strong follow-through")
             elif breakout.get("volatility_expansion"):
                 thesis.append("Volatility expansion detected")
