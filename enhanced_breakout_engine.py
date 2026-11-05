@@ -140,8 +140,8 @@ class EnhancedBreakoutEngine:
                 "atr_percentile": round(atr_rank, 3),
                 "range_high": float(range_high),
                 "range_low": float(range_low),
-                "volume_confirmed": volume_data["volume_confirmed"],
-                "relative_volume": volume_data["relative_volume"],
+                "volume_confirmed": volume_data.get("volume_confirmed", False),
+                "relative_volume": volume_data.get("relative_volume", 0.0),
                 "weekly_volume_confirmed": volume_data.get("weekly_confirmed", False),
                 "sustainability": sustainability.get("sustained", False),
                 "volatility_expansion": vol_expansion.get("expanded", False),
@@ -277,44 +277,44 @@ class EnhancedBreakoutEngine:
 
         # Squeeze detection bonus
         is_squeeze = atr_percentile < EnhancedBreakoutEngine.CONFIG.min_squeeze_percentile
-        
+
         if bullish_breakout:
             breakout_type = "BULLISH_BREAKOUT"
             score += 30  # Base score
-            
-            if volume_data["volume_confirmed"]:
+
+            if volume_data.get("volume_confirmed"):
                 score += 25
                 flags.append("VOLUME_CONFIRMED")
-            
+
             if volume_data.get("weekly_confirmed"):
                 score += 8
                 flags.append("WEEKLY_VOLUME_CONFIRMED")
-            
+
             if is_squeeze:
                 score += 12
                 flags.append("SQUEEZE")
-            
-            if volume_data["is_accumulating"]:
+
+            if volume_data.get("is_accumulating"):
                 score += 10
                 flags.append("ACCUMULATION")
-            
-            if volume_data["obv_bullish_div"]:
+
+            if volume_data.get("obv_bullish_divergence"):
                 score += 8
                 flags.append("OBV_BULLISH_DIV")
-        
+
         elif bearish_breakout:
             breakout_type = "BEARISH_BREAKOUT"
             score += 30
-            
-            if volume_data["volume_confirmed"]:
+
+            if volume_data.get("volume_confirmed"):
                 score += 25
                 flags.append("VOLUME_CONFIRMED")
-            
+
             if is_squeeze:
                 score += 12
                 flags.append("SQUEEZE")
-            
-            if volume_data["obv_bearish_div"]:
+
+            if volume_data.get("obv_bearish_divergence"):
                 score += 10
                 flags.append("OBV_BEARISH_DIV")
         
@@ -471,7 +471,7 @@ class EnhancedBreakoutEngine:
         smc: bool,
     ) -> str:
         """Assess overall signal quality"""
-        if score >= 80 and volume_data["volume_confirmed"] and htf and smc:
+        if score >= 80 and volume_data.get("volume_confirmed") and htf and smc:
             return "INSTITUTIONAL_GRADE"
         if score >= 65:
             return "HIGH_QUALITY"
