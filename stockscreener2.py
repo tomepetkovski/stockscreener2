@@ -2189,7 +2189,7 @@ class BreakoutEngine:
                     "volume_increasing": volume_data.get("volume_increasing", False),
                     "volume_strength": volume_data.get("volume_strength", 1.0),
                     "obv_bullish_divergence": volume_data.get("obv_bullish_divergence"),
-                    "obv_bearish_divergence": volume_data["obv_bearish_div"],
+                    "obv_bearish_divergence": volume_data.get("obv_bearish_divergence"),
                     "volatility_expansion": volume_data["volatility_expansion"],
                     "pattern": None,
                     "smc_alignment": False,
@@ -2331,7 +2331,7 @@ class BreakoutEngine:
                 "obv_bullish_divergence":
                     volume_data.get("obv_bullish_divergence"),
                 "obv_bearish_divergence":
-                    volume_data["obv_bearish_div"],
+                    volume_data.get("obv_bearish_divergence"),
 
                 # Pattern
                 "pattern": pattern_data["pattern"],
@@ -2620,7 +2620,7 @@ class BreakoutEngine:
             if squeeze:
                 score += cls.SCORING.squeeze_bonus
 
-            if volume_data["obv_bearish_div"]:
+            if volume_data.get("obv_bearish_divergence"):
                 score += cls.SCORING.obv_divergence
 
             # Additional filter: z-score direction and volume trend
