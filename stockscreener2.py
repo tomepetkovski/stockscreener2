@@ -48,6 +48,7 @@ from types import SimpleNamespace
 # Enhanced modules for improved accuracy and profitability
 from enhanced_breakout_engine import EnhancedBreakoutEngine
 from enhanced_risk_manager import EnhancedRiskManager, PerformanceTracker
+from decision_engine import DecisionEngine
 
 
 
@@ -5776,6 +5777,7 @@ class InvestmentProposal:
 
     order_flow: dict
     ml_prognosis: dict
+    decision: Dict[str, Any] = field(default_factory=dict)
 
     # Fundamental quality metrics
     fundamental_quality: float = 50.0
@@ -5977,7 +5979,7 @@ class MarketScanner:
                 df=df_daily,
                 market_regime=market_regime,
                 sector_rotation=sector_rotation,
-                use_order_flow=False,
+                use_order_flow=True,
                 use_ml=True,
             )
             if proposal is None:
@@ -6002,8 +6004,9 @@ class MarketScanner:
         for sr in hits:
             p = sr.proposal
             base = (
-                _safe(p.ai_confidence) * 0.70
-                + _safe(getattr(p, "short_term_score", 0)) * 0.30
+                _safe(p.ai_confidence) * 0.5
+                + _safe(getattr(p, "short_term_score", 0)) * 0.2
+                + _safe((getattr(p, "decision", {}) or {}).get("score", 0)) * 0.3
             )
             opp_b  = _OPP_BOOST.get(sr.opp_type,  6.0)
             cap_b  = _CAP_TIER_WEIGHT.get(sr.cap_tier, 2.0)
@@ -6367,7 +6370,7 @@ class CrashProtectionEngine:
 
         # 1. Market Regime Analysis
         overall_regime = market_regime.get("_overall", "NEUTRAL") if market_regime else "NEUTRAL"
-        vix = float(market_regime.get("VIX", {}).get("close", 20)) if market_regime else 20
+        vix = float(market_regime.get("VIX", {}).get("level", 20)) if market_regime else 20
 
         if overall_regime in ("STRONG_BEAR", "BEAR"):
             reasons.append(f"Bearish regime: {overall_regime}")
@@ -7134,6 +7137,17 @@ class ProposalEngine:
                 confidence,
             )
 
+            decision = DecisionEngine.decide(
+                df=df, features=features, ai=ai, ml=ml_forecast if use_ml else None,
+                analysts=analysts, funds=funds, sentiment=sentiment,
+                market_regime=market_regime, sector_flow=sector_flow_ctx,
+                crash=crash_protection, event_risk=event_risk,
+                rr=rr, stop_loss=trade["sl"],
+            )
+            if decision["verdict"] in ("HOLD", "REDUCE", "AVOID"):
+                return None
+            pos_size *= decision["size_multiplier"]
+
             # ---------------------------------------------
             # MONTE CARLO SIMULATION (optional)
             # ---------------------------------------------
@@ -7214,6 +7228,7 @@ class ProposalEngine:
                 short_term_score=short_term,
                 order_flow=order_flow_ctx,
                 ml_prognosis=ml_forecast,
+                decision=decision,
                 fundamental_quality=funds.get("buffett_score", 45.0),
                 piotroski_f=funds.get("piotroski_f", 0),
                 altman_z=funds.get("altman_z"),
@@ -9175,6 +9190,7 @@ def main_ui():
 
         with st.spinner("Market breadth..."):
             breadth = MarketBreadthEngine.analyze()
+        market_regime["market_breadth"] = {"pct_above_ma": breadth.get("pct_above_50dma", 50)}
 
         _render_market_dashboard(market_regime, sector_rotation, breadth)
 
@@ -9383,7 +9399,7 @@ def main_ui():
             st.error("No valid setups found. Lower confidence or expand universe.")
             return
 
-        proposals.sort(key=lambda x: x.ai_confidence, reverse=True)
+        proposals.sort(key=lambda x: (getattr(x, "decision", {}) or {}).get("score", 0), reverse=True)
 
         # Ensure all proposals have valid position sizing (safety net for quick_surface or legacy)
         for _p in proposals:
