@@ -50,7 +50,11 @@ from enhanced_breakout_engine import EnhancedBreakoutEngine
 from enhanced_risk_manager import EnhancedRiskManager, PerformanceTracker
 from decision_engine import DecisionEngine
 
+from upside_engine import UpsideProbabilityEngine, FinnhubAnalystEngine
 
+# inside InvestmentProposal (after mc_p95):
+    upside_score: float = 0.0
+    upside: Dict[str, Any] = field(default_factory=dict)
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -4739,7 +4743,8 @@ class OrderFlowEngine:
             # Liquidity grab detection (wicks vs body)
             upper_wick = h - c
             lower_wick = c - low
-            body = abs(c - c.shift(1).fillna(c))
+            o = df["open"]
+            body = abs(c - o)
             liquidity_grab = (upper_wick.iloc[-1] > 2 * body.iloc[-1]) or (lower_wick.iloc[-1] > 2 * body.iloc[-1])
 
             # Stop run detection (wicks + volume spike)
@@ -5323,179 +5328,11 @@ class ExternalDataProvider:
             )
 
             return fallback or {}
-class AnalystConsensusEngine:
-
-    @staticmethod
-    def get_ratings(symbol: str) -> Dict[str, Any]:
-
-        try:
-            ticker = yf.Ticker(symbol)
-
-            info = {}
-
-            try:
-                info = ticker.info
-                if not isinstance(info, dict):
-                    info = {}
-            except Exception:
-                info = {}
-
-            recommendation = str(
-                info.get("recommendationKey", "hold")
-            ).lower()
-
-            analyst_count = int(
-                info.get("numberOfAnalystOpinions") or 0
-            )
-
-            target_mean = AnalystConsensusEngine._safe_float(
-                info.get("targetMeanPrice")
-            )
-
-            current_price = AnalystConsensusEngine._safe_float(
-                info.get("currentPrice")
-            )
-
-            upside = 0.0
-
-            if current_price and target_mean:
-                upside = ((target_mean - current_price) / current_price) * 100
-
-            score_map = {
-                "strong_buy": 95,
-                "buy": 85,
-                "overweight": 80,
-                "hold": 60,
-                "underperform": 35,
-                "sell": 20,
-            }
-
-            score = score_map.get(recommendation, 50)
-
-            # Generate synthetic analyst comments based on recommendation
-            comments = []
-            if analyst_count > 0:
-                if recommendation == "strong_buy":
-                    comments.append(f"Strong bullish outlook with {analyst_count} analysts recommending")
-                    if upside > 20:
-                        comments.append(f"Significant upside potential of {upside:.1f}% to target price")
-                elif recommendation == "buy":
-                    comments.append(f"Bullish consensus with {analyst_count} analysts rating buy")
-                    if upside > 10:
-                        comments.append(f"Expected upside of {upside:.1f}% to mean target")
-                elif recommendation == "overweight":
-                    comments.append(f"Outperform recommendation with {analyst_count} analysts")
-                elif recommendation == "hold":
-                    comments.append(f"Neutral stance with {analyst_count} analysts at hold")
-                elif recommendation == "underperform":
-                    comments.append(f"Caution advised with {analyst_count} analysts rating underperform")
-                elif recommendation == "sell":
-                    comments.append(f"Bearish outlook with {analyst_count} analysts recommending sell")
-
-            return {
-                "source": "Yahoo/Nasdaq Aggregated",
-                "recommendation": recommendation.upper(),
-                "analyst_count": analyst_count,
-                "target_price": target_mean,
-                "current_price": current_price,
-                "upside_pct": round(upside, 2),
-                "score": score,
-                "comments": comments
-            }
-
-        except Exception as e:
-
-            logger.warning(
-                f"[{symbol}] AnalystConsensusEngine failed: {e}"
-            )
-
-            return {
-                "source": "Fallback",
-                "recommendation": "HOLD",
-                "analyst_count": 0,
-                "target_price": None,
-                "current_price": None,
-                "upside_pct": 0,
-                "score": 50
-            }
-
-    @staticmethod
-    def _safe_float(x, fallback=0.0):
-        try:
-            if x is None:
-                return fallback
-            return float(x)
-        except Exception:
-            return fallback
-
-
 # =========================================================
 # PROPOSAL MODEL
 # =========================================================
 # ANALYST CONSENSUS ENGINE
 # =========================================================
-
-class AnalystConsensusEngine:
-
-    @staticmethod
-    def get(symbol: str) -> Dict[str, Any]:
-
-        result = {
-            "score": 50,
-            "label": "NEUTRAL",
-            "sources": {}
-        }
-
-        try:
-
-            zacks = ZacksEngine.get_rank(symbol)
-            yahoo = YahooFinanceEngine.get_rating(symbol)
-            nasdaq = NasdaqEngine.get_rating(symbol)
-            fool = MotleyFoolEngine.get_sentiment(symbol)
-            barrons = BarronsEngine.get_sentiment(symbol)
-            insider = InsiderMonkeyEngine.get_activity(symbol)
-
-            scores = []
-
-            for item in [zacks, yahoo, nasdaq, fool, barrons, insider]:
-
-                if item and isinstance(item, dict):
-                    val = item.get("score")
-
-                    if isinstance(val, (int, float)):
-                        scores.append(val)
-
-            if scores:
-                avg = np.mean(scores)
-            else:
-                avg = 50
-
-            label = "NEUTRAL"
-
-            if avg >= 75:
-                label = "STRONG BUY"
-            elif avg >= 60:
-                label = "BUY"
-            elif avg <= 35:
-                label = "SELL"
-
-            result = {
-                "score": round(avg, 2),
-                "label": label,
-                "sources": {
-                    "zacks": zacks,
-                    "yahoo": yahoo,
-                    "nasdaq": nasdaq,
-                    "motley_fool": fool,
-                    "barrons": barrons,
-                    "insider_monkey": insider
-                }
-            }
-
-        except Exception as e:
-            logger.warning(f"[{symbol}] AnalystConsensusEngine failed: {e}")
-
-        return result
 
 import re
 import requests
@@ -5778,6 +5615,8 @@ class InvestmentProposal:
     order_flow: dict
     ml_prognosis: dict
     decision: Dict[str, Any] = field(default_factory=dict)
+    upside_score: float = 0.0
+    upside: Dict[str, Any] = field(default_factory=dict)
 
     # Fundamental quality metrics
     fundamental_quality: float = 50.0
@@ -5878,6 +5717,8 @@ class MarketScanner:
         logger.info("Step 2 / 4: Market regime …")
         try:
             market_regime = MarketRegimeEngine.analyze()
+            breadth = MarketBreadthEngine.analyze()
+            market_regime["market_breadth"] = {"pct_above_ma": breadth.get("pct_above_50dma", 50)}
             logger.info(
                 "Regime: %s (score %d)",
                 market_regime.get("_overall"),
@@ -6004,9 +5845,10 @@ class MarketScanner:
         for sr in hits:
             p = sr.proposal
             base = (
-                _safe(p.ai_confidence) * 0.5
-                + _safe(getattr(p, "short_term_score", 0)) * 0.2
-                + _safe((getattr(p, "decision", {}) or {}).get("score", 0)) * 0.3
+                _safe(p.ai_confidence) * 0.35
+                + _safe(getattr(p, "short_term_score", 0)) * 0.15
+                + _safe((getattr(p, "decision", {}) or {}).get("score", 0)) * 0.25
+                + _safe(getattr(p, "upside_score", 0)) * 0.25
             )
             opp_b  = _OPP_BOOST.get(sr.opp_type,  6.0)
             cap_b  = _CAP_TIER_WEIGHT.get(sr.cap_tier, 2.0)
@@ -6040,9 +5882,10 @@ class MarketScanner:
 class AnalystConsensusEngine:
 
     WEIGHTS = {
-        "zacks": 0.35,
-        "yahoo_consensus": 0.45,
-        "yahoo": 0.20,
+        "zacks": 0.10,
+        "yahoo_consensus": 0.35,
+        "yahoo": 0.10,
+        "finnhub": 0.45,
     }
 
     @staticmethod
@@ -6059,6 +5902,7 @@ class AnalystConsensusEngine:
                 "zacks": ZacksEngine.get_rank(symbol),
                 "yahoo_consensus": YahooConsensusEngine.get_rating(symbol),
                 "yahoo": YahooFinanceAnalystEngine.get_rating(symbol),
+                "finnhub": FinnhubAnalystEngine.get_rating(symbol),
             }
 
             for source_name, raw in raw_sources.items():
@@ -6826,6 +6670,11 @@ class ProposalEngine:
         mc_sl_mode: str = "ATR",
         mc_atr_mult: float = 2.0,
         mc_rr: str = "1,2,3",
+        # Upside parameters
+        use_upside: bool = True,
+        upside_min_score: float = 60.0,
+        upside_strict: bool = True,
+        upside_deep: bool = True,
     ) -> Optional[InvestmentProposal]:
 
         try:
@@ -7148,6 +6997,30 @@ class ProposalEngine:
                 return None
             pos_size *= decision["size_multiplier"]
 
+            # Upside Engine evaluation
+            upside: Dict[str, Any] = {}
+            if use_upside and direction == "LONG":
+                try:
+                    upside = UpsideProbabilityEngine.evaluate(
+                        symbol, df, df_weekly,
+                        sentiment=sentiment, analysts=analysts, funds=funds,
+                        market_regime=market_regime,
+                        deep=upside_deep, strict=upside_strict,
+                    )
+                    if upside.get("hard_fail"):
+                        logger.info(f"[{symbol}] Upside hard-fail: {upside.get('fail_reasons')}")
+                        return None
+                    if upside.get("upside_score", 0) < upside_min_score:
+                        return None
+                    confidence = float(np.clip(0.55 * confidence + 0.45 * upside.get("upside_score", 0), 0, 100))
+                    if _ov in ("BEAR", "STRONG_BEAR") and confidence < 72:
+                        return None
+                    if confidence < ProposalEngine.MIN_CONFIDENCE:
+                        return None
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Upside engine failed: {e}")
+                    upside = {}
+
             # ---------------------------------------------
             # MONTE CARLO SIMULATION (optional)
             # ---------------------------------------------
@@ -7229,6 +7102,8 @@ class ProposalEngine:
                 order_flow=order_flow_ctx,
                 ml_prognosis=ml_forecast,
                 decision=decision,
+                upside_score=upside.get("upside_score", 0.0),
+                upside=upside,
                 fundamental_quality=funds.get("buffett_score", 45.0),
                 piotroski_f=funds.get("piotroski_f", 0),
                 altman_z=funds.get("altman_z"),
@@ -8143,7 +8018,7 @@ class MarketBreadthEngine:
         try:
             df = yf.download(
                 MarketBreadthEngine.BREADTH_BASKET,
-                period="6mo",
+                period="1y",
                 interval="1d",
                 auto_adjust=True,
                 progress=False,
