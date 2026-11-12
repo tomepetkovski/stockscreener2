@@ -52,10 +52,6 @@ from decision_engine import DecisionEngine
 
 from upside_engine import UpsideProbabilityEngine, FinnhubAnalystEngine
 
-# inside InvestmentProposal (after mc_p95):
-    upside_score: float = 0.0
-    upside: Dict[str, Any] = field(default_factory=dict)
-
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("InstitutionalEngine_v4")
