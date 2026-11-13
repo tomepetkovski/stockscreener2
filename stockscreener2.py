@@ -2547,8 +2547,8 @@ class BreakoutEngine:
             "volume_zscore": round(float(volume_zscore), 2),
             "relative_volume": round(float(relative_volume), 2),
             "is_accumulating": bool(is_accumulating),
-            "obv_bullish_div": bool(obv_bullish_div),
-            "obv_bearish_div": bool(obv_bearish_div),
+            "obv_bullish_divergence": bool(obv_bullish_divergence),
+            "obv_bearish_divergence": bool(obv_bearish_divergence),
             "volatility_expansion": (
                 volume_zscore > 1.5
             ),
