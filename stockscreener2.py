@@ -52,6 +52,7 @@ from decision_engine import DecisionEngine
 
 from upside_engine import UpsideProbabilityEngine, FinnhubAnalystEngine
 from terminal_enhancements import *
+from decision_context import enrich_finalists, telegram_block, render_streamlit
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -543,8 +544,14 @@ class TelegramNotifier:
                 "",
                 f"🧪 <b>Backtest:</b> {safe_num(getattr(p,'bt_win_rate',0))*100:.0f}% win · {safe_num(getattr(p,'bt_expectancy_R',0)):+.2f}R · n={getattr(p,'bt_trades',0)}",
                 "",
-                f"<i>For informational purposes only — not financial advice.</i>",
             ]
+            
+            # Add decision context block
+            ctx = getattr(p, "context", None)
+            if ctx:
+                block.insert(-2, telegram_block(ctx))
+            
+            block.append(f"<i>For informational purposes only — not financial advice.</i>")
             return self.send("\n".join(block))
         except Exception as exc:
             logger.error("send_opportunity error: %s", exc)
@@ -9301,6 +9308,14 @@ def main_ui():
             st.error("No valid setups found. Lower confidence or expand universe.")
             return
 
+        # Enrich finalists with decision context
+        proposals = enrich_finalists(
+            proposals,
+            df_fn=lambda s: _download_timeframe(s, "2y", "1d"),
+            top_n=15,
+            include_options=(asset_class == "Stocks"),
+        )
+
         proposals.sort(key=lambda x: (getattr(x, "decision", {}) or {}).get("score", 0), reverse=True)
 
         # Ensure all proposals have valid position sizing (safety net for quick_surface or legacy)
@@ -10094,6 +10109,11 @@ def main_ui():
                         st.plotly_chart(fig, use_container_width=True)
                     except Exception:
                         st.warning("Chart unavailable")
+
+                # Decision context display
+                ctx = getattr(p, "context", None)
+                if ctx:
+                    render_streamlit(st, ctx)
 
                 st.markdown("---")
 
