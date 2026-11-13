@@ -51,6 +51,7 @@ from enhanced_risk_manager import EnhancedRiskManager, PerformanceTracker
 from decision_engine import DecisionEngine
 
 from upside_engine import UpsideProbabilityEngine, FinnhubAnalystEngine
+from terminal_enhancements import *
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -767,6 +768,7 @@ def _run_scan_job(
             _auto_scan_log.pop(0)
 
         ranked = scanner.scan()
+        ranked = AlertDeduper().filter_new(ranked)
 
         if not ranked:
             if send_empty:
@@ -1861,7 +1863,7 @@ class SectorRotationEngine:
 
         try:
             # Fetch SPY for relative strength
-            spy = yf.download("SPY", period="6mo", interval="1d", progress=False, auto_adjust=True)
+            spy = safe_yf_download("SPY", period="6mo", interval="1d", auto_adjust=True)
             spy = normalize_ohlcv(spy)
             spy_return = (spy['close'].iloc[-1] / spy['close'].iloc[0] - 1) * 100 if spy is not None else 0
         except:
@@ -1869,7 +1871,7 @@ class SectorRotationEngine:
 
         for symbol, name in SECTOR_ETFS.items():
             try:
-                df = yf.download(symbol, period="6mo", interval="1d", progress=False, auto_adjust=True)
+                df = safe_yf_download(symbol, period="6mo", interval="1d", auto_adjust=True)
                 df = normalize_ohlcv(df)
                 if df is None or len(df) < 50:
                     continue
@@ -2515,12 +2517,12 @@ class BreakoutEngine:
         price_change = close.iloc[-1] - close.iloc[-20]
         obv_change = obv.iloc[-1] - obv.iloc[-20]
 
-        obv_bullish_div = (
+        obv_bullish_divergence = (
             price_change < 0
             and obv_change > 0
         )
 
-        obv_bearish_div = (
+        obv_bearish_divergence = (
             price_change > 0
             and obv_change < 0
         )
@@ -4260,14 +4262,14 @@ class AIEnsemble:
                 breakout_score = 15
                 if aligned: breakout_score += 8
                 if htf_aligned: breakout_score += 7
-                if "SQUEEZE" in breakout: breakout_score += 5
-                if "LOW_VOL" not in breakout: breakout_score += 3
+                if features.get("squeeze_detected"): breakout_score += 5
+                if features.get("volume_confirmed"): breakout_score += 3
                 signals.append(f"Bullish breakout (strength: {breakout_strength})")
             elif "BEARISH" in breakout:
                 breakout_score = -15
                 if aligned: breakout_score -= 8
                 if htf_aligned: breakout_score -= 7
-                if "SQUEEZE" in breakout: breakout_score -= 5
+                if features.get("squeeze_detected"): breakout_score -= 5
                 signals.append(f"Bearish breakout (strength: {breakout_strength})")
         
         # Pre-breakout bonus (consolidation near resistance + accumulation)
@@ -4578,7 +4580,8 @@ class AIEnsemble:
 
         # --- 14. ML prognosis (history-trained probabilities) ---
         if (ml_forecast and ml_forecast.get("trained")
-                and (ml_forecast.get("balanced_accuracy_holdout") or 0) >= 0.40):
+                and (ml_forecast.get("balanced_accuracy_holdout") or 0) >= 0.45
+                and (ml_forecast.get("cv_accuracy_mean") or 0) >= 0.40):
             pl = float(ml_forecast.get("p_long", 1.0 / 3.0))
             ps = float(ml_forecast.get("p_short", 1.0 / 3.0))
             ml_edge = (pl - ps) * 35.0
@@ -5680,7 +5683,7 @@ class MarketScanner:
         workers: int = _SCAN_WORKERS,
         min_confidence: float = _MIN_CONFIDENCE,
     ):
-        self.universe = universe or _STOCK_UNIVERSE
+        self.universe = sanitize_universe(universe or _STOCK_UNIVERSE)
         self.universe_catalog = universe_catalog or _UNIVERSE_CATALOG
         self.workers = workers
         self.min_confidence = min_confidence
@@ -5808,6 +5811,7 @@ class MarketScanner:
             sector   = meta.get("sector", "—")
 
             df_daily = _download_timeframe(symbol, "2y", "1d")
+            report_download_result(symbol, ok=df_daily is not None and len(df_daily) > 0)
             if df_daily is None or df_daily.empty or len(df_daily) < 60:
                 return None
 
@@ -6846,11 +6850,18 @@ class ProposalEngine:
             event_score = float(event_risk.get("risk_score", 0.0))
 
             if evt_advice == "AVOID_NEW":
-                logger.info(
-                    f"[{symbol}] Blocking new position — high event risk: "
-                    f"{event_risk.get('flags', [])}"
-                )
-                return None
+                # Check days to earnings - only block within 3 days
+                days_to = event_risk.get("days_to", 99)
+                if days_to <= 3:
+                    logger.info(
+                        f"[{symbol}] Blocking new position — high event risk ({days_to} days): "
+                        f"{event_risk.get('flags', [])}"
+                    )
+                    return None
+                # 4-10 days: halve position size
+                elif 4 <= days_to <= 10:
+                    pos_size *= 0.5
+                    logger.info(f"[{symbol}] Halving position size due to {days_to} days to earnings")
 
             # Reduce confidence for medium / low-med risks
             if evt_advice == "REDUCE_SIZE":
@@ -8646,6 +8657,7 @@ def send_telegram_results(
         return "failed", 0, 0, f"connection error: {exc}"
 
     # ── Sanity-check ────────────────────────────────────────────────
+    ranked_proposals = AlertDeduper().filter_new(ranked_proposals)
     if not notifier.token or not notifier.chat_id:
         return "skipped", 0, 0, "token or chat-id not configured"
     if not notifier._connected:
@@ -8682,6 +8694,14 @@ def send_telegram_results(
         top_n         =top_n,
         total_scanned =total_scanned,
     )
+    
+    # JOURNAL integration
+    for p in ranked_proposals:
+        p.position_size_pct *= JOURNAL.size_multiplier(p.ai_confidence)
+    rep = PortfolioConstructor().select(ranked_proposals, market_regime.get("_overall", "NEUTRAL"))
+    ranked_proposals = rep["selected"]
+    for p in ranked_proposals:
+        JOURNAL.log(p, market_regime.get("_overall", "NEUTRAL"))
 
     global _TG_SENT_TOTAL, _TG_FAIL_TOTAL
     _TG_SENT_TOTAL += ok_n
@@ -8713,6 +8733,8 @@ def main_ui():
     import numpy as np
     import pandas as pd
     import time
+    
+    JOURNAL = SignalJournal()
 
     st.set_page_config(layout="wide", page_title="Institutional Breakout Terminal v4")
 
@@ -9003,6 +9025,15 @@ def main_ui():
     if st.sidebar.button("Re-check Telegram", key="tg_recheck"):
         st.session_state.tg_conn = None  # force re-probe on next rerender
         st.rerun()
+
+    # JOURNAL calibration analysis
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📈 Journal Calibration")
+    def _fetch(sym, start):
+        d = safe_yf_download(sym, start=start, interval="1d", auto_adjust=True)
+        return normalize_ohlcv(d)
+    JOURNAL.evaluate(_fetch)
+    st.dataframe(JOURNAL.calibration())
 
     # =========================================================
     # HELPERS
