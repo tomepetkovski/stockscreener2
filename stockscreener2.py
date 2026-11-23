@@ -53,6 +53,11 @@ from decision_engine import DecisionEngine
 from upside_engine import UpsideProbabilityEngine, FinnhubAnalystEngine
 from terminal_enhancements import *
 from decision_context import enrich_finalists, telegram_block, render_streamlit
+from macro_sentiment_engine import (
+    MacroSentimentEngine, symbol_sentiment, render_macro_panel,
+    telegram_line, start_macro_watch,
+)
+MacroSentimentEngine.downloader = lambda *a, **k: safe_yf_download(*a, **k)
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -577,6 +582,9 @@ class TelegramNotifier:
         if top10_mix:
             mix_str = "  ".join(f"<b>{k}</b>: {v}" for k,v in sorted(top10_mix.items(), key=lambda x:-x[1]))
             lines.append(f"🏗 Top-10 mix → {mix_str}")
+        _mac = market_regime.get("_macro")
+        if _mac:
+            lines.append(telegram_line(_mac))
         lines.append(f"🌐 Universe: {total_scanned} US equities  |  🕐 {ts}")
         return self.send("\n".join(lines))
 
@@ -856,6 +864,10 @@ def _auto_scan_daemon() -> None:
 
     notifier = TelegramNotifier()
     scanner  = MarketScanner(workers=_SCAN_WORKERS)
+    try:
+        start_macro_watch(notifier.send)
+    except Exception:
+        logger.exception("macro watcher failed to start")
 
     # Fire immediately so the first scan isn't delayed by one interval
     sched.every(_AUTO_SCAN_INTERVAL_HOURS).hours.do(
@@ -4229,6 +4241,9 @@ class SentimentEngine:
 # 9. AI ENSEMBLE (ENHANCED WITH CONFLUENCE)
 # ===============================================
 
+SentimentEngine.analyze = staticmethod(symbol_sentiment)
+
+
 class AIEnsemble:
     """
     Enhanced AI Ensemble with multi-factor confluence scoring.
@@ -4618,10 +4633,20 @@ class AIEnsemble:
             score -= fam - float(np.clip(fam, -22, 22))
             signals.append("Trend-family contribution capped (correlated factors)")
 
+        # --- 15. MACRO / SENTIMENT OVERLAY ---
+        macro_adj = float(features.get("macro_adj", 0.0) or 0.0)
+        if macro_adj:
+            weights["macro"] = round(macro_adj, 1)
+            score += macro_adj
+        signals.extend(features.get("macro_signals", []) or [])
+        _long_thr = AI_LONG_THRESHOLD + float(
+            ((market_regime or {}).get("_macro") or {}).get("long_threshold_bump", 0.0) or 0.0
+        )
+
         # --- FINAL SCORING ---
         score = float(np.clip(score, 0, 100))
 
-        if score >= AI_LONG_THRESHOLD:
+        if score >= _long_thr:
             direction = "LONG"
         elif score <= AI_SHORT_THRESHOLD:
             direction = "SHORT"
@@ -4632,14 +4657,14 @@ class AIEnsemble:
             pl = float(ml_forecast.get("p_long", 1.0 / 3.0))
             ps = float(ml_forecast.get("p_short", 1.0 / 3.0))
             if direction == "LONG" and pl < 0.26 and ps > pl + 0.08:
-                if score >= AI_LONG_THRESHOLD + 8:  # 8-pt buffer keeps ≥50 after penalty
+                if score >= _long_thr + 8:  # 8-pt buffer keeps ≥50 after penalty
                     score = max(0.0, score - 8.0)
                     signals.append("ML conflict: probabilities lean SHORT vs rule-based LONG")
             elif direction == "SHORT" and ps < 0.26 and pl > ps + 0.08:
                 score = max(0.0, score - 8.0)  # Safe: lowers score further into SHORT
                 signals.append("ML conflict: probabilities lean LONG vs rule-based SHORT")
             score = float(np.clip(score, 0, 100))
-            if score >= AI_LONG_THRESHOLD:
+            if score >= _long_thr:
                 direction = "LONG"
             elif score <= AI_SHORT_THRESHOLD:
                 direction = "SHORT"
@@ -5725,6 +5750,7 @@ class MarketScanner:
             market_regime = MarketRegimeEngine.analyze()
             breadth = MarketBreadthEngine.analyze()
             market_regime["market_breadth"] = {"pct_above_ma": breadth.get("pct_above_50dma", 50)}
+            market_regime["_macro"] = MacroSentimentEngine.snapshot()
             logger.info(
                 "Regime: %s (score %d)",
                 market_regime.get("_overall"),
@@ -6203,6 +6229,15 @@ class CrashProtectionEngine:
     MODERATE = "MODERATE"  # 🟡 Be cautious
     LOW = "LOW"  # 🟢 Normal
 
+    _RANK = {"LOW": 0, "MODERATE": 1, "HIGH": 2, "CRITICAL": 3}
+
+    @staticmethod
+    def _bump(cur: str, new: str) -> str:
+        """Return the more severe level (the old code used max() on strings,
+        which compares alphabetically: HIGH/CRITICAL could never beat LOW)."""
+        r = CrashProtectionEngine._RANK
+        return new if r.get(new, 0) > r.get(cur, 0) else cur
+
     @staticmethod
     def assess_crash_risk(
         market_regime: Dict[str, Any],
@@ -6225,25 +6260,25 @@ class CrashProtectionEngine:
 
         if overall_regime in ("STRONG_BEAR", "BEAR"):
             reasons.append(f"Bearish regime: {overall_regime}")
-            warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+            warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.MODERATE)
             position_adjustment *= 0.7
 
         if overall_regime == "STRONG_BEAR":
             reasons.append("Strong bear market detected")
-            warning_level = max(warning_level, CrashProtectionEngine.HIGH)
+            warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.HIGH)
             position_adjustment *= 0.5
 
         if vix > 35:
             reasons.append(f"Extreme VIX: {vix:.1f}")
-            warning_level = max(warning_level, CrashProtectionEngine.CRITICAL)
+            warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.CRITICAL)
             position_adjustment *= 0.3
         elif vix > 25:
             reasons.append(f"Elevated VIX: {vix:.1f}")
-            warning_level = max(warning_level, CrashProtectionEngine.HIGH)
+            warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.HIGH)
             position_adjustment *= 0.6
         elif vix > 20:
             reasons.append(f"Moderate VIX: {vix:.1f}")
-            warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+            warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.MODERATE)
             position_adjustment *= 0.8
 
         # 2. Market Breadth Analysis
@@ -6252,15 +6287,15 @@ class CrashProtectionEngine:
 
         if breadth_pct < 15:
             reasons.append(f"Extreme market weakness: {breadth_pct:.1f}% above MA")
-            warning_level = max(warning_level, CrashProtectionEngine.CRITICAL)
+            warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.CRITICAL)
             position_adjustment *= 0.2
         elif breadth_pct < 25:
             reasons.append(f"Weak market breadth: {breadth_pct:.1f}% above MA")
-            warning_level = max(warning_level, CrashProtectionEngine.HIGH)
+            warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.HIGH)
             position_adjustment *= 0.5
         elif breadth_pct < 40:
             reasons.append(f"Declining market breadth: {breadth_pct:.1f}% above MA")
-            warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+            warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.MODERATE)
             position_adjustment *= 0.8
 
         # 3. Technical Analysis
@@ -6271,17 +6306,17 @@ class CrashProtectionEngine:
 
             if price_below_200ma:
                 reasons.append("Price below 200-day MA")
-                warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+                warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.MODERATE)
                 position_adjustment *= 0.8
 
             if rsi < 30:
                 reasons.append(f"Oversold RSI: {rsi:.1f}")
-                warning_level = max(warning_level, CrashProtectionEngine.HIGH)
+                warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.HIGH)
                 position_adjustment *= 0.6
 
             if atr_expansion:
                 reasons.append("ATR expansion (high volatility)")
-                warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+                warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.MODERATE)
                 position_adjustment *= 0.8
 
         # 4. Order Flow Analysis
@@ -6289,7 +6324,7 @@ class CrashProtectionEngine:
             of_bias = order_flow.get("of_bias", "")
             if of_bias == "BEARISH":
                 reasons.append("Bearish order flow bias")
-                warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+                warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.MODERATE)
                 position_adjustment *= 0.8
 
         # 5. Volume Analysis
@@ -6297,7 +6332,23 @@ class CrashProtectionEngine:
             obv_bearish_div = volume_data.get("obv_bearish_div", False)
             if obv_bearish_div:
                 reasons.append("OBV bearish divergence")
-                warning_level = max(warning_level, CrashProtectionEngine.MODERATE)
+                warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.MODERATE)
+                position_adjustment *= 0.8
+
+        # 6. Macro / sentiment stress (from MacroSentimentEngine)
+        _macro = (market_regime or {}).get("_macro") or {}
+        if _macro:
+            _lvl = int(_macro.get("stress_level", 0) or 0)
+            for _r in (list(_macro.get("shock_flags", [])) + list(_macro.get("early_warnings", [])))[:3]:
+                reasons.append(f"Macro: {_r}")
+            if _lvl >= 3:
+                warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.CRITICAL)
+                position_adjustment *= 0.3
+            elif _lvl == 2:
+                warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.HIGH)
+                position_adjustment *= 0.5
+            elif _lvl == 1:
+                warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.MODERATE)
                 position_adjustment *= 0.8
 
         # Final adjustment based on warning level
@@ -6787,6 +6838,19 @@ class ProposalEngine:
                 close * 0.02
             )
 
+            # --- macro / sentiment overlay ---
+            macro = (market_regime or {}).get("_macro") or {}
+            if macro:
+                try:
+                    _mo = MacroSentimentEngine.symbol_overlay(
+                        symbol, df, macro,
+                        _UNIVERSE_CATALOG.get(symbol, {}).get("sector", ""),
+                    )
+                    techs["macro_adj"] = _mo["score_adj"]
+                    techs["macro_signals"] = _mo["signals"]
+                except Exception as _me:
+                    logger.debug("[%s] macro overlay failed: %s", symbol, _me)
+
             # --- 60-day relative strength vs SPY ---
             _roc60 = (df["close"].iloc[-1] / df["close"].iloc[-61] - 1) * 100 if len(df) > 61 else 0.0
             techs["rs_60d"] = _roc60 - float((market_regime.get("SPY") or {}).get("roc_60d", 0) or 0)
@@ -6855,10 +6919,12 @@ class ProposalEngine:
             evt_advice  = event_risk.get("position_advice", "STANDARD")
             event_flags = event_risk.get("flags", [])
             event_score = float(event_risk.get("risk_score", 0.0))
+            _halve_pos = False
 
             if evt_advice == "AVOID_NEW":
                 # Check days to earnings - only block within 3 days
-                days_to = event_risk.get("days_to", 99)
+                days_to = event_risk.get("days_to_earnings")
+                days_to = 99 if days_to is None else days_to
                 if days_to <= 3:
                     logger.info(
                         f"[{symbol}] Blocking new position — high event risk ({days_to} days): "
@@ -6867,7 +6933,7 @@ class ProposalEngine:
                     return None
                 # 4-10 days: halve position size
                 elif 4 <= days_to <= 10:
-                    pos_size *= 0.5
+                    _halve_pos = True
                     logger.info(f"[{symbol}] Halving position size due to {days_to} days to earnings")
 
             # Reduce confidence for medium / low-med risks
@@ -6886,6 +6952,13 @@ class ProposalEngine:
                     confidence = max(0, confidence - 10)
                 elif bt["expectancy_R"] > 0.25 and bt["win_rate_lb"] > 0.36:
                     confidence = min(100, confidence + 3)
+
+            # ---- macro gates ----
+            if macro.get("block_new_longs") and direction == "LONG" and confidence < 80:
+                logger.info(f"[{symbol}] Blocked: macro {macro.get('label')} (confidence {confidence:.0f} < 80)")
+                return None
+            if confidence < ProposalEngine.MIN_CONFIDENCE + float(macro.get("min_confidence_bump", 0.0) or 0.0):
+                return None
 
             # ---- hard regime gate ----
             _ov = market_regime.get("_overall", "NEUTRAL") if market_regime else "NEUTRAL"
@@ -6945,6 +7018,11 @@ class ProposalEngine:
                 avg_loss=bt.get("avg_loss_R") if bt_n >= SignalBacktester.MIN_TRADES else None,
                 atr_percentile=techs.get("atr_percentile", 50) / 100.0 if "atr_percentile" in techs else 0.5,
             )
+
+            # Macro / earnings sizing
+            if _halve_pos:
+                pos_size *= 0.5
+            pos_size *= float(macro.get("position_multiplier", 1.0) or 1.0)
 
             # Apply crash protection adjustment to position size
             crash_adj = crash_protection.get("position_adjustment", 1.0)
@@ -9100,8 +9178,10 @@ def main_ui():
         with st.spinner("Market breadth..."):
             breadth = MarketBreadthEngine.analyze()
         market_regime["market_breadth"] = {"pct_above_ma": breadth.get("pct_above_50dma", 50)}
+        market_regime["_macro"] = MacroSentimentEngine.snapshot()
 
         _render_market_dashboard(market_regime, sector_rotation, breadth)
+        render_macro_panel(st, market_regime["_macro"])
 
         # One-shot proxies for crypto (BTC) / forex (DXY) momentum vs scan universe
         def _scan_flow_reference(ac: str) -> Dict[str, Any]:
