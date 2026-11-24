@@ -222,6 +222,104 @@ def _num(x) -> Optional[float]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# yfinance FALLBACK (used when Finnhub has no usable key / no data for a ticker)
+# ---------------------------------------------------------------------------
+_YF_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_YF_LOCK = threading.Lock()
+
+
+def _yf_growth(symbol: str, strict: bool = True) -> Dict[str, Any]:
+    """Same output schema as MultiYearGrowthFilter.evaluate, from ~4 annual income statements."""
+    base: Dict[str, Any] = {"available": False, "score": 50.0, "hard_fail": False,
+                            "reasons": [], "label": "NO_DATA", "source": "yfinance"}
+    with _YF_LOCK:
+        hit = _YF_CACHE.get(symbol)
+        if hit and time.time() - hit[0] < 24 * 3600:
+            return hit[1]
+    try:
+        import yfinance as yf
+        stmt = yf.Ticker(symbol).income_stmt
+    except Exception as exc:
+        logger.debug("yfinance income_stmt failed for %s: %s", symbol, exc)
+        return base
+    if stmt is None or getattr(stmt, "empty", True):
+        return base
+
+    def row(*names: str) -> List[float]:
+        for n in names:
+            if n in stmt.index:
+                ser = stmt.loc[n].dropna()
+                try:
+                    return [float(v) for _, v in sorted(ser.items(), key=lambda kv: kv[0])]
+                except Exception:
+                    return []
+        return []
+
+    rev = row("Total Revenue", "Operating Revenue")
+    ni = row("Net Income", "Net Income Common Stockholders")
+    eps = row("Diluted EPS", "Basic EPS")
+    n = min(len(rev), len(ni))
+    if n < 3:
+        return base
+    rev, ni = rev[-n:], ni[-n:]
+
+    score, reasons = 0.0, []
+
+    # revenue: overall direction (25) + share of rising years (15)
+    rev_up = rev[-1] > rev[0]
+    score += 25 if rev_up else 0
+    reasons.append(f"{'✓' if rev_up else '✗'} revenue {rev[0]/1e9:.2f}B → {rev[-1]/1e9:.2f}B over {n} yrs")
+    steps = n - 1
+    rising = sum(1 for i in range(1, n) if rev[i] > rev[i - 1])
+    score += 15.0 * rising / steps
+    reasons.append(f"{'✓' if rising == steps else '✗'} revenue rose {rising}/{steps} yrs")
+
+    # profitability: profitable years (25) + net income trend (15)
+    profitable = sum(1 for v in ni if v > 0)
+    score += 25.0 * profitable / n
+    reasons.append(f"{'✓' if profitable == n else '✗'} profitable {profitable}/{n} yrs")
+    ni_up = ni[-1] > ni[0]
+    score += 15 if ni_up else 0
+    reasons.append(f"{'✓' if ni_up else '✗'} net income trend {'up' if ni_up else 'down'}")
+
+    # EPS trend (10)
+    if len(eps) >= 3:
+        eps_up = eps[-1] > eps[0]
+        score += 10 if eps_up else 0
+        reasons.append(f"{'✓' if eps_up else '✗'} EPS trend {'up' if eps_up else 'down'}")
+    else:
+        score += 5                                       # neutral when EPS row missing
+
+    # net margin stable / expanding (10)
+    margins = [a / b * 100 for a, b in zip(ni, rev) if b > 0]
+    if len(margins) >= 3:
+        half = max(1, len(margins) // 2)
+        early, late = sum(margins[:half]) / half, sum(margins[-half:]) / half
+        if late >= early - 1.0:
+            score += 10
+            reasons.append("✓ net margin stable/expanding")
+        else:
+            reasons.append("✗ net margin shrinking")
+
+    final = round(min(100.0, score), 1)
+    hard = bool(profitable < n / 2 or (not rev_up and not ni_up))
+    out = dict(base)
+    out.update({
+        "available": True,
+        "score": final,
+        "hard_fail": hard if strict else False,
+        "reasons": reasons,
+        "label": "STRONG" if final >= 75 else "SOLID" if final >= 55 else "WEAK",
+        "profitable_years": f"{profitable}/{n}",
+        "years_observed": n,
+    })
+    with _YF_LOCK:
+        _YF_CACHE[symbol] = (time.time(), out)
+    return out
+
+
+
 class MultiYearGrowthFilter:
     """
     Score 0-100 for multi-year continuity of profit / revenue / returns.
@@ -242,7 +340,7 @@ class MultiYearGrowthFilter:
         data = get_client().get("/stock/metric", {"symbol": symbol.upper(), "metric": "all"},
                                 ttl=24 * 3600)
         if not isinstance(data, dict) or not data.get("metric"):
-            return out
+            return _yf_growth(symbol, strict)          # Finnhub unavailable / no coverage
 
         m, series = data["metric"], data.get("series") or {}
         eps3, eps5 = _num(m.get("epsGrowth3Y")), _num(m.get("epsGrowth5Y"))
@@ -292,9 +390,8 @@ class MultiYearGrowthFilter:
         max_pts += 25 if observed >= 3 else 0
         max_pts += 10 if roe5 is not None else 0
         max_pts += 5 if roe_ttm is not None else 0
-        if max_pts < 40:                                 # too little evidence
-            out["reasons"] = ["insufficient multi-year data"]
-            return out
+        if max_pts < 40:                                 # too little evidence from Finnhub
+            return _yf_growth(symbol, strict)
 
         final = round(score / max_pts * 100.0, 1)
         hard = bool(
