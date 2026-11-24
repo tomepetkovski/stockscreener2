@@ -73,7 +73,43 @@ if not getattr(_fhc, "_validated", False):
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("InstitutionalEngine_v4")
 
+def load_finnhub_keys() -> list[str]:
+    """Env var FINNHUB_API_KEYS (comma/space separated), then st.secrets, then fallback.
+    Also splits any accidentally concatenated 40/60-char strings into 20-char keys."""
+    raw = os.environ.get("FINNHUB_API_KEYS", "") or os.environ.get("FINNHUB_API_KEY", "")
+    try:
+        if not raw and hasattr(st, "secrets") and "finnhub" in st.secrets:
+            raw = str(st.secrets["finnhub"].get("api_keys", ""))
+    except Exception:
+        pass
+    raw = raw or "dbms6khr01qn1o670s3g,dbms6khr01qn1o670s40"   # fallback; prefer env/secrets
 
+    keys: list[str] = []
+    for tok in re.split(r"[,\s;]+", raw.strip()):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if len(tok) % 20 == 0 and len(tok) > 20:          # concatenated keys
+            keys += [tok[i:i+20] for i in range(0, len(tok), 20)]
+        else:
+            keys.append(tok)
+    return list(dict.fromkeys(keys))
+
+FINNHUB_KEYS = load_finnhub_keys()
+
+def validate_finnhub_keys() -> list[str]:
+    ok = []
+    for k in FINNHUB_KEYS:
+        try:
+            r = requests.get("https://finnhub.io/api/v1/quote",
+                             params={"symbol": "AAPL", "token": k}, timeout=8)
+            logger.info("Finnhub key …%s → HTTP %s", k[-4:], r.status_code)
+            if r.status_code == 200:
+                ok.append(k)
+        except Exception as e:
+            logger.warning("Finnhub probe failed: %s", e)
+    return ok
+  
 # =====================================================
 # YAHOO FINANCE STDERR-SILENCE HELPERS
 # =====================================================
