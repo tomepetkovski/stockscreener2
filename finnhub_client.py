@@ -12,7 +12,7 @@ Adds:
   * analyst_rating(symbol)      -> dict usable as the "finnhub" source in AnalystConsensusEngine
   * MultiYearGrowthFilter       -> 3-5 year earnings / revenue / margin / ROE continuity score
 
-Keys: env FINNHUB_API_KEYS="key1,key2"  or  .streamlit/secrets.toml:
+Keys: .env / env FINNHUB_API_KEYS="key1,key2"  or  .streamlit/secrets.toml:
         [finnhub]
         api_keys = "key1,key2"
 """
@@ -29,9 +29,15 @@ import requests
 
 logger = logging.getLogger("finnhub_client")
 
-# Fallback only if env / secrets are empty. Rotate these keys (they were pasted in chat)
-# and prefer FINNHUB_API_KEYS instead of hard-coding.
-_FALLBACK_KEYS = "dbms6khr01qn1o670s3g,dbms6khr01qn1o670s40"
+try:                                     # optional: pip install python-dotenv
+    from dotenv import load_dotenv
+    load_dotenv()                        # reads ./.env if present; real env vars still win
+except Exception:
+    pass
+
+# No keys are stored in this file. Put them in a local .env (never committed),
+# Streamlit secrets, or real environment variables — see .env.example.
+_FALLBACK_KEYS = ""
 
 
 # ---------------------------------------------------------------------------
