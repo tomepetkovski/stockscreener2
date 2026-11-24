@@ -59,6 +59,16 @@ from macro_sentiment_engine import (
 )
 MacroSentimentEngine.downloader = lambda *a, **k: safe_yf_download(*a, **k)
 
+# --- Finnhub client (key splitting, 401 disable, throttle, cache) ---
+import finnhub_client as fh
+_fhc = fh.get_client()
+if not getattr(_fhc, "_validated", False):
+    try:
+        _fhc.validate()
+    except Exception as _fh_exc:
+        logging.getLogger(__name__).warning("Finnhub validate failed: %s", _fh_exc)
+    _fhc._validated = True
+
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("InstitutionalEngine_v4")
@@ -802,7 +812,7 @@ def _run_scan_job(
         for p in (ranked or []):
             ac = getattr(p, "analyst_consensus", None)
             ac_label = ac.get("label", "") if ac else ""
-            if ac_label in ("STRONG BUY", "BUY"):
+            if ac_label in ("STRONG BUY", "BUY") or (ac and float(ac.get("coverage", 0) or 0) < 50 and float(getattr(p, "ai_confidence", 0) or 0) >= 70):
                 filtered_ranked.append(p)
             elif ac_label:
                 logger.debug(f"_run_scan_job: Filtered out {getattr(p, 'symbol', '?')} - analyst label: {ac_label}")
@@ -5681,6 +5691,8 @@ class InvestmentProposal:
     mc_median: float = 0.0
     mc_p5: float = 0.0
     mc_p95: float = 0.0
+    # Multi-year growth continuity (Finnhub)
+    growth_quality: Dict[str, Any] = field(default_factory=dict)
 
 
 # =========================================================
@@ -5935,7 +5947,7 @@ class AnalystConsensusEngine:
                 "zacks": ZacksEngine.get_rank(symbol),
                 "yahoo_consensus": YahooConsensusEngine.get_rating(symbol),
                 "yahoo": YahooFinanceAnalystEngine.get_rating(symbol),
-                "finnhub": FinnhubAnalystEngine.get_rating(symbol),
+                "finnhub": fh.analyst_rating(symbol),
             }
 
             for source_name, raw in raw_sources.items():
@@ -6788,6 +6800,13 @@ class ProposalEngine:
                 symbol
             ) or {}
 
+            # ---- 3-5 year growth continuity (Finnhub) ----
+            growth = fh.MultiYearGrowthFilter.evaluate(symbol, strict=True)
+            if growth.get("hard_fail"):
+                logger.info(f"[{symbol}] Multi-year growth hard-fail: {growth.get('reasons', [])[:3]}")
+                return None
+
+
             sentiment = SentimentEngine.analyze(
                 symbol
             ) or {}
@@ -6910,12 +6929,15 @@ class ProposalEngine:
                 ai.get("confidence"),
                 50
             )
+            if growth.get("available"):
+                confidence = float(np.clip(confidence + (growth["score"] - 50) * 0.12, 0, 100))
+
 
             # ---------------------------------------------
             # EARNINGS / EVENT CALENDAR RISK CHECK
             # ---------------------------------------------
 
-            event_risk = EarningsCalendarEngine.assess(symbol)
+            event_risk = _evt0
             evt_advice  = event_risk.get("position_advice", "STANDARD")
             event_flags = event_risk.get("flags", [])
             event_score = float(event_risk.get("risk_score", 0.0))
@@ -7219,6 +7241,7 @@ class ProposalEngine:
             mc_median=mc_result.get("median", 0.0),
             mc_p5=mc_result.get("p5", 0.0),
             mc_p95=mc_result.get("p95", 0.0),
+            growth_quality=growth,
             )
 
         except Exception as e:
@@ -8755,7 +8778,7 @@ def send_telegram_results(
     for p in (ranked_proposals or []):
         ac = getattr(p, "analyst_consensus", None)
         ac_label = ac.get("label", "") if ac else ""
-        if ac_label in ("STRONG BUY", "BUY"):
+        if ac_label in ("STRONG BUY", "BUY") or (ac and float(ac.get("coverage", 0) or 0) < 50 and float(getattr(p, "ai_confidence", 0) or 0) >= 70):
             filtered_proposals.append(p)
         elif ac_label:
             logger.debug(f"Filtered out {getattr(p, 'symbol', '?')} - analyst label: {ac_label}")
@@ -8819,7 +8842,8 @@ def main_ui():
     import pandas as pd
     import time
     
-    JOURNAL = SignalJournal()
+    global JOURNAL
+    JOURNAL = globals().get("JOURNAL") or SignalJournal()
 
     st.set_page_config(layout="wide", page_title="Institutional Breakout Terminal v4")
 
