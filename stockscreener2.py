@@ -57,7 +57,41 @@ from macro_sentiment_engine import (
     MacroSentimentEngine, symbol_sentiment, render_macro_panel,
     telegram_line, start_macro_watch,
 )
-MacroSentimentEngine.downloader = lambda *a, **k: safe_yf_download(*a, **k)
+
+# --- Заштитни stubs (ако модули не постојат) ---
+try:
+    from telegram_scanner import AlertDeduper, report_download_result
+except Exception:
+    class AlertDeduper:
+        @staticmethod
+        def filter_new(x): return x or []
+    def report_download_result(sym, ok=False):
+        pass
+
+try:
+    from decision_engine import DecisionEngine, enrich_finalists, telegram_block, render_streamlit
+except Exception:
+    class DecisionEngine:
+        @staticmethod
+        def decide(**kw):
+            return {"verdict": "BUY", "size_multiplier": 1.0, "score": 50}
+    def enrich_finalists(x, **kw): return x
+    def telegram_block(x): return ""
+    def render_streamlit(st, x): pass
+
+try:
+    from journal import SignalJournal, PortfolioConstructor
+    JOURNAL = SignalJournal()
+except Exception:
+    class SignalJournal:
+        def evaluate(self, fn): return self
+        def calibration(self): return pd.DataFrame()
+        def log(self, p, regime): pass
+        def size_multiplier(self, conf): return 1.0
+    class PortfolioConstructor:
+        def select(self, props, regime):
+            return {"selected": props}
+    JOURNAL = SignalJournal()
 
 # --- Finnhub client (key splitting, 401 disable, throttle, cache) ---
 import finnhub_client as fh
@@ -74,15 +108,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("InstitutionalEngine_v4")
 
 def load_finnhub_keys() -> list[str]:
-    """Env var FINNHUB_API_KEYS (comma/space separated), then st.secrets, then fallback.
-    Also splits any accidentally concatenated 40/60-char strings into 20-char keys."""
+    """Чита клучеви само од окружување (env) или Streamlit secrets."""
     raw = os.environ.get("FINNHUB_API_KEYS", "") or os.environ.get("FINNHUB_API_KEY", "")
     try:
         if not raw and hasattr(st, "secrets") and "finnhub" in st.secrets:
             raw = str(st.secrets["finnhub"].get("api_keys", ""))
     except Exception:
         pass
-    raw = raw or "dbms6khr01qn1o670s3g,dbms6khr01qn1o670s40"   # fallback; prefer env/secrets
 
     keys: list[str] = []
     for tok in re.split(r"[,\s;]+", raw.strip()):
@@ -256,6 +288,9 @@ def safe_yf_download(*args, retries=3, **kwargs):
                 time.sleep(1.5)
 
     return pd.DataFrame()
+
+# Configure MacroSentimentEngine to use safe_yf_download
+MacroSentimentEngine.downloader = lambda *a, **k: safe_yf_download(*a, **k)
 
 
 # ===============================================
@@ -4685,6 +4720,14 @@ class AIEnsemble:
             weights["macro"] = round(macro_adj, 1)
             score += macro_adj
         signals.extend(features.get("macro_signals", []) or [])
+
+        # --- Growth Continuity 3-5y (Weight: 15) ---
+        growth_score_val = features.get("growth_score", 50)
+        growth_weight = (growth_score_val - 50) * 0.25   # -12.5 to +12.5 points
+        weights["growth"] = round(growth_weight, 1)
+        score += growth_weight
+        signals.append(f"3-5y growth continuity: {growth_score_val:.0f}/100")
+
         _long_thr = AI_LONG_THRESHOLD + float(
             ((market_regime or {}).get("_macro") or {}).get("long_threshold_bump", 0.0) or 0.0
         )
@@ -6836,6 +6879,16 @@ class ProposalEngine:
                 symbol
             ) or {}
 
+            # --- 3-5 година историско растење (нова проверка) ---
+            growth_local = GrowthContinuityEngine.evaluate(symbol)
+            features_for_ai = {}  # ќе го користиме подолу
+            if growth_local.get("hard_fail"):
+                logger.info(f"[{symbol}] Rejected: no 3-5y growth continuity")
+                return None
+
+            # За AI фичии
+            features_for_ai["growth_score"] = growth_local["growth_score"]
+
             # ---- 3-5 year growth continuity (Finnhub) ----
             growth = fh.MultiYearGrowthFilter.evaluate(symbol, strict=True)
             if growth.get("hard_fail"):
@@ -6940,6 +6993,7 @@ class ProposalEngine:
                 analysts,
                 order_flow=order_flow_ctx,
             )
+            features["growth_score"] = growth_local["growth_score"]
 
             ai = AIEnsemble.predict(
                 features,
@@ -8741,7 +8795,7 @@ def _render_market_dashboard(market_regime, sector_rotation, breadth, proposals=
             "RS vs SPY": f"{safe_num(data.get('relative_strength')):+.1f}%"
         })
 
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -9756,7 +9810,7 @@ def main_ui():
         # -------------------------
         st.dataframe(
             edge_df,
-            width="stretch",
+            use_container_width=True,
             hide_index=True
         )
         # =========================================================
@@ -9811,7 +9865,7 @@ def main_ui():
         # -------------------------
         st.dataframe(
             fdf,
-            width="stretch",
+            use_container_width=True,
             hide_index=True
         )
 
@@ -9921,7 +9975,7 @@ def main_ui():
         # -------------------------
         st.dataframe(
             df,
-            width="stretch",
+            use_container_width=True,
             hide_index=True
         )
 
@@ -10234,21 +10288,35 @@ def main_ui():
                         if source_rows:
                             st.dataframe(
                                 pd.DataFrame(source_rows),
-                                width="stretch",
+                                use_container_width=True,
                                 hide_index=True
                             )
 
                 # -------------------------
-                # CHART (SAFE FIX)
+                # ЧАРТ (исправено)
                 # -------------------------
-                chart_data = getattr(p, "chart_data", None)
-
-                if chart_data is not None:
-                    try:
-                        # IMPORTANT: assumes fig is already defined elsewhere correctly
-                        st.plotly_chart(fig, use_container_width=True)
-                    except Exception:
-                        st.warning("Chart unavailable")
+                symbol_chart = getattr(p, "symbol", "")
+                try:
+                    _chart_df = _download_timeframe(symbol_chart, "6mo", "1d")
+                    if _chart_df is not None and not _chart_df.empty:
+                        _fig = ChartEngine.plot_setup(
+                            _chart_df,
+                            smc={},
+                            breakout=getattr(p, "breakout_analytics", {}) or {},
+                            techs=getattr(p, "sentiment_snapshot", {}) or {},
+                            direction=getattr(p, "direction", "LONG"),
+                            entry=getattr(p, "entry_price", 0),
+                            sl=getattr(p, "stop_loss", 0),
+                            tp1=getattr(p, "tp_1", 0),
+                            tp2=getattr(p, "tp_2", 0),
+                            tp3=getattr(p, "tp_3", 0),
+                        )
+                        st.plotly_chart(_fig, use_container_width=True)
+                    else:
+                        st.info("Нема доволно историски податоци за график.")
+                except Exception as _chart_exc:
+                    logger.warning("Грешка при цртање на график: %s", _chart_exc)
+                    st.warning("Графикот нема да се прикаже.")
 
                 # Decision context display
                 ctx = getattr(p, "context", None)
@@ -10311,5 +10379,137 @@ def main_ui():
             bias = "BALANCED / NEUTRAL EXPOSURE"
 
         st.caption(f"Portfolio stance: {bias}")
+
+
+# =========================================================
+# 14. GROWTH CONTINUITY ENGINE (3-5 ГОДИНИ ИСТОРИСКО РАСТЕЊЕ)
+# =========================================================
+
+class GrowthContinuityEngine:
+    """
+    Оценка на историски континуитет на растење за последни 3-5 години.
+    Проверива приходи (Revenue) и приманута печалба (Net Income / EPS).
+    Враќа growth_score (0-100) и hard_fail ако нема квалитетна история.
+    """
+
+    @staticmethod
+    def evaluate(symbol: str) -> Dict[str, Any]:
+        out = {
+            "growth_score": 0.0,
+            "growth_available": False,
+            "years_with_data": 0,
+            "consecutive_growth_years": 0,
+            "revenue_cagr_3y": 0.0,
+            "eps_cagr_3y": 0.0,
+            "hard_fail": False,
+            "reasons": [],
+        }
+
+        try:
+            ticker = yf.Ticker(symbol)
+
+            # Пробај нови API, потоа стари
+            income = None
+            try:
+                income = ticker.get_income_stmt()
+            except Exception:
+                income = getattr(ticker, "financials", None)
+
+            if income is None or income.empty:
+                out["reasons"].append("Нема данни за приходи (income statement).")
+                return out
+
+            # Извлеци редови (зависи од версията на yfinance)
+            rev = None
+            if "Total Revenue" in income.index:
+                rev = income.loc["Total Revenue"].dropna()
+            elif "Revenue" in income.index:
+                rev = income.loc["Revenue"].dropna()
+
+            net_income = None
+            if "Net Income" in income.index:
+                net_income = income.loc["Net Income"].dropna()
+            elif "Net Income Common Stockholders" in income.index:
+                net_income = income.loc["Net Income Common Stockholders"].dropna()
+
+            eps = None
+            if "Diluted EPS" in income.index:
+                eps = income.loc["Diluted EPS"].dropna()
+            elif "Basic EPS" in income.index:
+                eps = income.loc["Basic EPS"].dropna()
+
+            years = 0
+            consec = 0
+            rev_growth_list = []
+
+            if rev is not None and len(rev) >= 4:
+                rev_vals = rev.values.astype(float)
+                for i in range(1, len(rev_vals)):
+                    if rev_vals[i-1] > 0:
+                        g = (rev_vals[i] - rev_vals[i-1]) / rev_vals[i-1]
+                        rev_growth_list.append(g)
+                        years += 1
+                        if g > 0:
+                            consec += 1
+                        else:
+                            consec = 0  # Reset ако една година не расте
+
+                # CAGR за последни 3 интервала (ако имаме 4 точки)
+                if len(rev_vals) >= 4:
+                    start = rev_vals[-4]
+                    end = rev_vals[-1]
+                    if start > 0:
+                        out["revenue_cagr_3y"] = round(((end / start) ** (1/3) - 1) * 100, 2)
+
+            # EPS континуитет (дополнително)
+            if eps is not None and len(eps) >= 4:
+                eps_vals = eps.values.astype(float)
+                eps_growth_positive = 0
+                for i in range(1, len(eps_vals)):
+                    if eps_vals[i-1] != 0:
+                        g = (eps_vals[i] - eps_vals[i-1]) / abs(eps_vals[i-1])
+                        if g > 0:
+                            eps_growth_positive += 1
+                        else:
+                            consec = min(consec, 0)  # Не зголеми consecutive ако EPS падна
+
+                if len(eps_vals) >= 4:
+                    start = eps_vals[-4]
+                    end = eps_vals[-1]
+                    if start != 0:
+                        out["eps_cagr_3y"] = round(((end / start) ** (1/3) - 1) * 100, 2)
+
+            out["years_with_data"] = years
+            out["consecutive_growth_years"] = max(0, consec)
+            out["growth_available"] = True
+
+            # Скорирање 0-100
+            score = 0.0
+            if years >= 6:        # Барем 3-4 години данни
+                score += 30
+            if consec >= 3:       # Продолжено растење 3+ години
+                score += 40
+            elif consec == 2:
+                score += 20
+
+            if out["revenue_cagr_3y"] > 10:
+                score += 20
+            elif out["revenue_cagr_3y"] > 0:
+                score += 10
+
+            # Хард фаил: ако имаме барем 6 точки (3+ години), нема растење и негативен CAGR
+            if years >= 6 and consec == 0 and out["revenue_cagr_3y"] < -10:
+                out["hard_fail"] = True
+                out["reasons"].append("Нема континуитетно растење изнад 3 години и негативен 3г CAGR.")
+
+            out["growth_score"] = round(min(100.0, score), 1)
+            return out
+
+        except Exception as e:
+            logger.debug(f"[{symbol}] GrowthContinuityEngine: {e}")
+            out["reasons"].append(f"Грешка: {e}")
+            return out
+
+
 if __name__ == "__main__":
     main_ui()
