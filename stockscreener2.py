@@ -52,6 +52,11 @@ from decision_engine import DecisionEngine
 
 from upside_engine import UpsideProbabilityEngine, FinnhubAnalystEngine
 from terminal_enhancements import *
+# [IQ-PATCH 1] decision-quality upgrades
+from investment_quality import (
+    LiquidityGate, QualityEngine, GrowthContinuityEngineFixed,
+    risk_adjusted_score, finalize_proposals,
+)
 from decision_context import enrich_finalists, telegram_block, render_streamlit
 from macro_sentiment_engine import (
     MacroSentimentEngine, symbol_sentiment, render_macro_panel,
@@ -901,6 +906,13 @@ def _run_scan_job(
             )
             return
 
+        # [IQ-PATCH 6] journal sizing + portfolio construction + risk budget BEFORE sending
+        filtered_ranked, _rep = finalize_proposals(
+            filtered_ranked, getattr(scanner, "last_regime", None),
+            journal=JOURNAL, constructor=PortfolioConstructor(), top_n=top_n)
+        if not filtered_ranked:
+            logger.info("_run_scan_job: portfolio budget left no positions.")
+            return
         # Category mix for header (use filtered proposals)
         mix: Dict[str, int] = {}
         for p in filtered_ranked[:top_n]:
@@ -5976,7 +5988,9 @@ class MarketScanner:
             )
             opp_b  = _OPP_BOOST.get(sr.opp_type,  6.0)
             cap_b  = _CAP_TIER_WEIGHT.get(sr.cap_tier, 2.0)
-            boosted = round(base * (1.0 + opp_b / 100.0) * (1.0 + cap_b / 100.0), 4)
+            # [IQ-PATCH 5] risk-adjusted ranking (no cap-tier / opp-type bias)
+            _reg = (getattr(self, "last_regime", None) or {}).get("_overall", "NEUTRAL")
+            boosted = round(risk_adjusted_score(p, _reg), 4)
             setattr(p, "_composite_score", boosted)
             setattr(p, "_opp_type",       sr.opp_type)
             setattr(p, "_cap_tier",       sr.cap_tier)
@@ -6859,6 +6873,12 @@ class ProposalEngine:
             # ENGINES
             # ---------------------------------------------
 
+            # [IQ-PATCH 2] liquidity / staleness / volatility gate (stocks only)
+            if asset_class == "Stocks":
+                _liq = LiquidityGate.check(df)
+                if not _liq["ok"]:
+                    logger.info(f"[{symbol}] Rejected by liquidity gate: {_liq['reasons']}")
+                    return None
             techs = TechnicalEngine.get_indicators(df) or {}
             _evt0 = EarningsCalendarEngine.assess(symbol)
             techs.update(
@@ -6879,6 +6899,13 @@ class ProposalEngine:
                 symbol
             ) or {}
 
+            # [IQ-PATCH 3] real Piotroski / Altman / FCF yield / PEG
+            qual = QualityEngine.evaluate(symbol, get_info_cached(symbol))
+            if qual["veto"]:
+                logger.info(f"[{symbol}] Rejected by quality veto: {qual['flags']}")
+                return None
+            funds["piotroski_f"] = qual["piotroski"] or 0
+            funds["altman_z"] = qual["altman_z"]
             # --- 3-5 година историско растење (нова проверка) ---
             growth_local = GrowthContinuityEngine.evaluate(symbol)
             features_for_ai = {}  # ќе го користиме подолу
@@ -7019,6 +7046,8 @@ class ProposalEngine:
                 ai.get("confidence"),
                 50
             )
+            # [IQ-PATCH 4] quality nudge on confidence (+/-5 max)
+            confidence = float(np.clip(confidence + (qual["quality_score"] - 50) * 0.10, 0, 100))
             if growth.get("available"):
                 confidence = float(np.clip(confidence + (growth["score"] - 50) * 0.12, 0, 100))
 
@@ -8879,6 +8908,13 @@ def send_telegram_results(
         logger.info("send_telegram_results: No BUY/STRONG BUY stocks found.")
         return "skipped", 0, 0, "No BUY/STRONG BUY stocks found in results"
 
+    # [IQ-PATCH 7] same pipeline as auto-scan (replaces the old post-send JOURNAL block)
+    _mr = market_regime or {"_overall": "NEUTRAL"}
+    filtered_proposals, _rep = finalize_proposals(
+        filtered_proposals, _mr, journal=JOURNAL,
+        constructor=PortfolioConstructor(), top_n=top_n)
+    if not filtered_proposals:
+        return "skipped", 0, 0, "Portfolio budget left no positions"
     # Limit to top_n best opportunities
     filtered_proposals = filtered_proposals[:top_n]
 
@@ -8893,13 +8929,6 @@ def send_telegram_results(
         total_scanned =total_scanned,
     )
     
-    # JOURNAL integration
-    for p in ranked_proposals:
-        p.position_size_pct *= JOURNAL.size_multiplier(p.ai_confidence)
-    rep = PortfolioConstructor().select(ranked_proposals, market_regime.get("_overall", "NEUTRAL"))
-    ranked_proposals = rep["selected"]
-    for p in ranked_proposals:
-        JOURNAL.log(p, market_regime.get("_overall", "NEUTRAL"))
 
     global _TG_SENT_TOTAL, _TG_FAIL_TOTAL
     _TG_SENT_TOTAL += ok_n
@@ -9553,7 +9582,15 @@ def main_ui():
         # SUMMARY
         # =========================================================
 
+        # [IQ-PATCH 8] UI shows the same budget-adjusted sizes that Telegram will send
+        proposals, _budget_rep = finalize_proposals(
+            proposals, market_regime, journal=JOURNAL, constructor=PortfolioConstructor())
+        if not proposals:
+            st.error("Portfolio budget removed all setups for the current regime.")
+            return
         st.success(f"Found {len(proposals)} valid setups")
+        with st.expander("Portfolio risk budget", expanded=False):
+            st.json(_budget_rep)
 
         # Log analyst consensus labels for debugging
         buy_count = sum(1 for p in proposals if getattr(p, "analyst_consensus", {}).get("label") in ("STRONG BUY", "BUY"))
@@ -10511,5 +10548,7 @@ class GrowthContinuityEngine:
             return out
 
 
+# [IQ-PATCH 9] use the fixed growth engine (statement order, reachable hard-fail, neutral on missing data)
+GrowthContinuityEngine = GrowthContinuityEngineFixed
 if __name__ == "__main__":
     main_ui()
