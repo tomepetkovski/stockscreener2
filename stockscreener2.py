@@ -6953,7 +6953,9 @@ class ProposalEngine:
             # ---- 3-5 year growth continuity (Finnhub) ----
             growth = fh.MultiYearGrowthFilter.evaluate(symbol, strict=True)
             if growth.get("hard_fail"):
-                logger.info(f"[{symbol}] Multi-year growth hard-fail: {growth.get('reasons', [])[:3]}")
+                reasons = growth.get('reasons', [])
+                logger.info(f"[{symbol}] Multi-year growth hard-fail: {reasons[:5]}")
+                logger.debug(f"[{symbol}] Growth details: {growth}")
                 return None
 
 
@@ -8167,17 +8169,63 @@ class ProposalEngine:
 
 class ChartEngine:
     @staticmethod
-    def plot_setup(df, smc, breakout, techs, direction, entry, sl, tp1, tp2, tp3, df_weekly=None):
+    def plot_setup(df, smc, breakout, techs, direction, entry, sl, tp1, tp2, tp3, df_weekly=None, title=""):
         df_plt = df.iloc[-90:].copy()
         fig = make_subplots(
-            rows=3, cols=1,
+            rows=4, cols=1,
             shared_xaxes=True,
-            vertical_spacing=0.03,
-            row_heights=[0.65, 0.15, 0.20],
+            vertical_spacing=0.025,
+            row_heights=[0.56, 0.13, 0.14, 0.17],
             specs=[[{"secondary_y": False}],
+                   [{"secondary_y": True}],
                    [{"secondary_y": False}],
                    [{"secondary_y": False}]]
         )
+
+        direction = (direction or "LONG").upper()
+        is_long = direction != "SHORT"
+        dir_color = "#00c853" if is_long else "#ff1744"
+        dir_label = "LONG" if is_long else "SHORT"
+
+        # ---------- derived stats ----------
+        _close = df_plt["close"].astype(float)
+        _open = df_plt["open"].astype(float)
+        _high = df_plt["high"].astype(float)
+        _low = df_plt["low"].astype(float)
+        _vol = df_plt["volume"].astype(float)
+
+        _vol_ma = _vol.rolling(20).mean()
+        _vol_std = _vol.rolling(20).std().replace(0, np.nan)
+        vol_z = ((_vol - _vol_ma) / _vol_std).fillna(0.0)
+
+        # footprint-style buy/sell delta proxy per bar
+        _hl = (_high - _low).replace(0, np.nan)
+        delta = (((_close - _low) - (_high - _close)) / _hl * _vol).fillna(0.0)
+        cum_delta = delta.cumsum()
+
+        # volume profile (POC / VAH / VAL) over visible window
+        poc = vah = val = None
+        try:
+            if len(df_plt) >= 30 and float(_high.max()) > float(_low.min()):
+                _typ = ((_high + _low + _close) / 3.0).to_numpy()
+                _edges = np.linspace(float(_low.min()), float(_high.max()), 25)
+                _idx = np.clip(np.digitize(_typ, _edges) - 1, 0, 23)
+                _vb = np.zeros(24)
+                np.add.at(_vb, _idx, _vol.to_numpy())
+                _centers = (_edges[:-1] + _edges[1:]) / 2.0
+                poc = float(_centers[int(np.argmax(_vb))])
+                _order = np.argsort(_vb)[::-1]
+                _cum = np.cumsum(_vb[_order])
+                _tot = _cum[-1]
+                if _tot > 0:
+                    _keep = _order[_cum <= _tot * 0.70]
+                    if len(_keep):
+                        val = float(_centers[_keep].min())
+                        vah = float(_centers[_keep].max())
+                    else:
+                        val = vah = poc
+        except Exception:
+            pass
 
         # --- Row 1: Candlesticks + Indicators ---
         fig.add_trace(go.Candlestick(
@@ -8229,44 +8277,126 @@ class ChartEngine:
         fig.add_hline(y=tp3, line_dash="longdash", line_color="#00e676",
                       row=1, col=1, annotation_text="TP3 (Extended)")
 
-        # Volume
-        colors = ['#00c853' if x > 0 else '#ff1744' for x in df_plt['close'] - df_plt['open']]
-        vol_ma = df_plt['volume'].rolling(20).mean()
-        fig.add_trace(go.Bar(x=df_plt.index, y=df_plt['volume'], marker_color=colors, opacity=0.5, name='Volume'),
-                      row=2, col=1)
-        fig.add_trace(go.Scatter(x=df_plt.index, y=vol_ma, name='Vol MA20',
-                                 line=dict(color='white', width=1, dash='dash'), opacity=0.5), row=2, col=1)
+        # Volume profile levels (POC / VAH / VAL)
+        if vah is not None and val is not None:
+            fig.add_hrect(y0=val, y1=vah, fillcolor="teal", opacity=0.05,
+                          line_width=0, row=1, col=1)
+            fig.add_hline(y=poc, line_dash="solid", line_color="#ffd54f",
+                          opacity=0.85, row=1, col=1, annotation_text="POC")
+            fig.add_hline(y=vah, line_dash="dot", line_color="#00e676",
+                          opacity=0.6, row=1, col=1, annotation_text="VAH")
+            fig.add_hline(y=val, line_dash="dot", line_color="#ff5252",
+                          opacity=0.6, row=1, col=1, annotation_text="VAL")
 
-        # --- Row 3: RSI ---
+        # Big buy/sell order markers (volume z-score >= 2)
+        _big = vol_z >= 2.0
+        if int(_big.sum()) > 12:
+            _thr = vol_z[_big].nlargest(12).iloc[-1]
+            _big = vol_z >= _thr
+        if bool(_big.any()):
+            _buy = _big & (_close >= _open)
+            _sell = _big & (_close < _open)
+            if bool(_buy.any()):
+                fig.add_trace(go.Scatter(
+                    x=df_plt.index[_buy.to_numpy()],
+                    y=(_low * 0.99)[_buy],
+                    mode="markers",
+                    marker=dict(symbol="triangle-up", size=11,
+                                color="#00e676", line=dict(color="white", width=0.5)),
+                    name="BIG BUY",
+                    text=[f"BIG BUY z={z:.1f}" for z in vol_z[_buy]],
+                    textposition="bottom center",
+                ), row=1, col=1)
+            if bool(_sell.any()):
+                fig.add_trace(go.Scatter(
+                    x=df_plt.index[_sell.to_numpy()],
+                    y=(_high * 1.01)[_sell],
+                    mode="markers",
+                    marker=dict(symbol="triangle-down", size=11,
+                                color="#ff1744", line=dict(color="white", width=0.5)),
+                    name="BIG SELL",
+                    text=[f"BIG SELL z={z:.1f}" for z in vol_z[_sell]],
+                    textposition="top center",
+                ), row=1, col=1)
+
+        # Volume + z-score (secondary axis)
+        colors = ['#00c853' if x > 0 else '#ff1744' for x in _close - _open]
+        fig.add_trace(go.Bar(x=df_plt.index, y=_vol, marker_color=colors, opacity=0.55, name='Volume'),
+                      row=2, col=1)
+        fig.add_trace(go.Scatter(x=df_plt.index, y=_vol_ma, name='Vol MA20',
+                                 line=dict(color='white', width=1, dash='dash'), opacity=0.6), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df_plt.index, y=vol_z, name='Vol Z',
+                                 line=dict(color='#ffd54f', width=1.2), opacity=0.9),
+                      row=2, col=1, secondary_y=True)
+        fig.add_trace(go.Scatter(
+            x=[df_plt.index[0], df_plt.index[-1]], y=[2.0, 2.0],
+            mode="lines", line=dict(color="orange", width=1, dash="dot"),
+            name="Z +2", showlegend=False), row=2, col=1, secondary_y=True)
+        fig.add_trace(go.Scatter(
+            x=[df_plt.index[0], df_plt.index[-1]], y=[-2.0, -2.0],
+            mode="lines", line=dict(color="orange", width=1, dash="dot"),
+            name="Z -2", showlegend=False), row=2, col=1, secondary_y=True)
+
+        # Footprint-style delta (buy/sell pressure proxy) + cumulative delta
+        _dcolors = ['#00c853' if x >= 0 else '#ff1744' for x in delta]
+        fig.add_trace(go.Bar(x=df_plt.index, y=delta, marker_color=_dcolors,
+                             opacity=0.6, name='Bar Δ'),
+                      row=3, col=1)
+        fig.add_trace(go.Scatter(x=df_plt.index, y=cum_delta, name='Cum Δ',
+                                 line=dict(color='white', width=1.3), opacity=0.9), row=3, col=1)
+        fig.add_hline(y=0, line_color='gray', opacity=0.4, row=3, col=1)
+
+        # --- Row 4: RSI ---
         # Calculate RSI for the plot data
-        delta = df_plt['close'].diff()
-        gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-        loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+        delta_rsi = df_plt['close'].diff()
+        gain = delta_rsi.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta_rsi.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
         rs = gain / (loss.replace(0, np.nan))
         rsi = 100 - (100 / (1 + rs))
 
         fig.add_trace(go.Scatter(x=df_plt.index, y=rsi, name='RSI',
-                                 line=dict(color='#ab47bc', width=1.5)), row=3, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.3, row=3, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.3, row=3, col=1)
-        fig.add_hrect(y0=30, y1=70, fillcolor="gray", opacity=0.05, row=3, col=1)
+                                 line=dict(color='#ab47bc', width=1.5)), row=4, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.3, row=4, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.3, row=4, col=1)
+        fig.add_hrect(y0=30, y1=70, fillcolor="gray", opacity=0.05, row=4, col=1)
 
         fig.update_layout(
-            height=650,
+            height=800,
+            title=dict(
+                text=f"{title or 'Setup'}  |  {dir_label} bias",
+                font=dict(size=14, color="white")
+            ),
             xaxis_rangeslider_visible=False,
-            margin=dict(t=20, b=10, l=10, r=10),
+            margin=dict(t=45, b=10, l=10, r=10),
             paper_bgcolor="#0e1117",
             font_color="white",
             plot_bgcolor="#0e1117",
             legend=dict(font=dict(size=9), orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            xaxis=dict(gridcolor='#1a1a2e'),
-            yaxis=dict(gridcolor='#1a1a2e'),
-            xaxis2=dict(gridcolor='#1a1a2e'),
-            yaxis2=dict(gridcolor='#1a1a2e'),
-            xaxis3=dict(gridcolor='#1a1a2e'),
-            yaxis3=dict(gridcolor='#1a1a2e')
         )
         fig.update_xaxes(showgrid=True, gridwidth=0.5, gridcolor='#1a1a2e')
+        fig.update_yaxes(showgrid=True, gridwidth=0.5, gridcolor='#1a1a2e')
+        fig.update_yaxes(title_text="Price", row=1, col=1)
+        fig.update_yaxes(title_text="Volume", row=2, col=1)
+        fig.update_yaxes(title_text="Vol Z", row=2, col=1, secondary_y=True)
+        fig.update_yaxes(title_text="Δ Volume", row=3, col=1)
+        fig.update_yaxes(title_text="RSI", row=4, col=1)
+
+        # Expected-direction arrow on the last bar
+        try:
+            _lx = df_plt.index[-1]
+            _ly = float(_close.iloc[-1])
+            fig.add_annotation(
+                x=_lx, y=_ly,
+                text=dir_label,
+                showarrow=True, arrowhead=2, arrowsize=1.3, arrowwidth=2,
+                arrowcolor=dir_color,
+                font=dict(color="white", size=13, family="Arial Black"),
+                bgcolor=dir_color, bordercolor="white", borderwidth=1, borderpad=4,
+                yshift=-35 if is_long else 35,
+                row=1, col=1,
+            )
+        except Exception:
+            pass
         return fig
 
 class MarketBreadthEngine:
@@ -8859,7 +8989,7 @@ def _render_market_dashboard(market_regime, sector_rotation, breadth, proposals=
             "RS vs SPY": f"{safe_num(data.get('relative_strength')):+.1f}%"
         })
 
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -9881,7 +10011,7 @@ def main_ui():
         # -------------------------
         st.dataframe(
             edge_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
         # =========================================================
@@ -9936,7 +10066,7 @@ def main_ui():
         # -------------------------
         st.dataframe(
             fdf,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -10046,7 +10176,7 @@ def main_ui():
         # -------------------------
         st.dataframe(
             df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -10359,7 +10489,7 @@ def main_ui():
                         if source_rows:
                             st.dataframe(
                                 pd.DataFrame(source_rows),
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True
                             )
 
@@ -10381,8 +10511,9 @@ def main_ui():
                             tp1=getattr(p, "tp_1", 0),
                             tp2=getattr(p, "tp_2", 0),
                             tp3=getattr(p, "tp_3", 0),
+                            title=symbol_chart,
                         )
-                        st.plotly_chart(_fig, use_container_width=True)
+                        st.plotly_chart(_fig, width="stretch")
                     else:
                         st.info("Нема доволно историски податоци за график.")
                 except Exception as _chart_exc:
