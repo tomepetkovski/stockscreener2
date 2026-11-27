@@ -73,16 +73,8 @@ except Exception:
     def report_download_result(sym, ok=False):
         pass
 
-try:
-    from decision_engine import DecisionEngine, enrich_finalists, telegram_block, render_streamlit
-except Exception:
-    class DecisionEngine:
-        @staticmethod
-        def decide(**kw):
-            return {"verdict": "BUY", "size_multiplier": 1.0, "score": 50}
-    def enrich_finalists(x, **kw): return x
-    def telegram_block(x): return ""
-    def render_streamlit(st, x): pass
+# [PATCH-1] removed: this block could replace the real DecisionEngine / decision_context
+# functions with stubs. DecisionEngine is imported at the top of the file.
 
 try:
     from journal import SignalJournal, PortfolioConstructor
@@ -166,14 +158,20 @@ _orig_stderr = _sys.stderr
 class _YFSilentBuffer(_io.StringIO):
     def write(self, s: str) -> int:
         if any(pat in s for pat in _YAHOO_SPAM):
-            return 0
-        _orig_stderr.write(s)
-        return 0
+            return len(s)
+        try:
+            return _orig_stderr.write(s)
+        except Exception:
+            return len(s)
 
     def flush(self) -> None:
-        pass
+        try:
+            _orig_stderr.flush()
+        except Exception:
+            pass
 
 _yf_buf = _YFSilentBuffer()
+_sys.stderr = _yf_buf   # [PATCH-2] installed once; no per-call swapping (thread-safe)
 
 # ---- tunables added by apply_patches ----
 AI_LONG_THRESHOLD: float = 58.0    # a zero-evidence stock (score 50) is no longer a LONG
@@ -213,12 +211,8 @@ _yf_error_401_count = 0   # global Yahoo Finance 401 counter (rate-limit throttl
 
 def _yf_call(fn, *args, **kwargs):
     """Run fn(*args, **kwargs) with sys.stderr pointed at Yahoo-spam filter."""
-    old = _sys.stderr
-    _sys.stderr = _yf_buf
-    try:
-        return fn(*args, **kwargs)
-    finally:
-        _sys.stderr = old
+    # [PATCH-2b] stderr filter is installed globally at import
+    return fn(*args, **kwargs)
 
 
 def safe_yf_download(*args, retries=3, **kwargs):
@@ -360,6 +354,7 @@ _DL_TTL_S: int = 10800   # 3 h
 _LAST_SCAN_AT:   Optional[datetime] = None
 _AUTO_SCAN_LOCK = threading.Lock()
 _auto_scan_log:  List[str] = []
+_AUTO_SCAN_STARTED = threading.Event()   # [PATCH-9]
 
 
 def _esc_html(text: str) -> str:
@@ -421,6 +416,24 @@ class TelegramNotifier:
 
     # ------------------------------------------------------------------
     def send(self, text: str) -> bool:
+        """[PATCH-4] Split >4000-char messages on line boundaries (every HTML tag
+        in this app opens and closes on one line, so line splits are safe)."""
+        if len(text) <= 4000:
+            return self._send_one(text)
+        parts, cur = [], ""
+        for line in text.split("\n"):
+            if len(cur) + len(line) + 1 > 4000:
+                parts.append(cur)
+                cur = ""
+            cur += line + "\n"
+        if cur.strip():
+            parts.append(cur)
+        ok = True
+        for p in parts:
+            ok = self._send_one(p) and ok
+        return ok
+
+    def _send_one(self, text: str) -> bool:
         """Send *text* to the configured chat.
 
         Retries up to ``_MAX_RETRIES`` times with jittered exponential
@@ -480,6 +493,8 @@ class TelegramNotifier:
                         "Telegram HTTP %s (attempt %d): %s",
                         r.status_code, attempt, detail,
                     )
+                    self.fail_count += 1
+                    return False  # [PATCH-4b] non-retryable 4xx
 
             except requests.exceptions.RequestException as exc:
                 logger.warning(
@@ -613,7 +628,7 @@ class TelegramNotifier:
             sig_md       = "\n".join(f"  ✓ {_esc_html(s)}" for s in top_sigs) if top_sigs else "  —"
 
             ac         = getattr(p,"analyst_consensus",{}) or {}
-            ac_label   = ac.get("label","N/A")
+            ac_label   = _esc_html(str(ac.get("label","N/A")))  # [PATCH-4c]
             ac_score   = fmt(ac.get("score",0),0)
             hold_per   = _esc_html(getattr(p,"hold_period","—") or "—")
 
@@ -633,7 +648,7 @@ class TelegramNotifier:
                 f"🔑 <b>Signals:</b>",
                 sig_md,
                 "",
-                f"🧪 <b>Backtest:</b> {safe_num(getattr(p,'bt_win_rate',0))*100:.0f}% win · {safe_num(getattr(p,'bt_expectancy_R',0)):+.2f}R · n={getattr(p,'bt_trades',0)}",
+                f"🧪 <b>Rule-proxy backtest:</b> {safe_num(getattr(p,'bt_win_rate',0))*100:.0f}% win · {safe_num(getattr(p,'bt_expectancy_R',0)):+.2f}R · n={getattr(p,'bt_trades',0)}",
                 "",
             ]
             
@@ -971,6 +986,9 @@ def _auto_scan_daemon() -> None:
         _AUTO_SCAN_INTERVAL_HOURS, _SCAN_WORKERS, _MIN_CONFIDENCE,
     )
 
+    # [PATCH-9c] first scan right away instead of after one full interval
+    _run_scan_job(notifier, scanner)
+
     while True:
         try:
             sched.run_pending()
@@ -987,6 +1005,10 @@ def start_auto_scan(
     """Start the background auto-scan daemon thread (once only)."""
     global _AUTO_SCAN_INTERVAL_HOURS, _AUTO_SCAN_INTERVAL_SECS
     global _SCAN_WORKERS, _MIN_CONFIDENCE
+    if _AUTO_SCAN_STARTED.is_set():   # [PATCH-9b] one daemon per process, not per browser session
+        logger.info("Auto-scan daemon already running — not starting another.")
+        return None
+    _AUTO_SCAN_STARTED.set()
 
     _AUTO_SCAN_INTERVAL_HOURS = float(interval_hours)
     _AUTO_SCAN_INTERVAL_SECS  = int(_AUTO_SCAN_INTERVAL_HOURS * 3600)
@@ -1296,8 +1318,10 @@ def _download_timeframe(
         )
         result = None
 
+    # [PATCH-3] failures live 2 min, successes live _DL_TTL_S
+    _ttl = _DL_TTL_S if result is not None else 120
     with _DL_LOCK:
-        _DL_CACHE[key] = (now, result)
+        _DL_CACHE[key] = (now - (_DL_TTL_S - _ttl), result)
     return result.copy() if result is not None else None
 
 def fetch_weekly_data(symbol: str) -> Optional[pd.DataFrame]:
@@ -2529,10 +2553,11 @@ class BreakoutEngine:
         threshold: float,
     ) -> int:
         """Vectorized consecutive count - O(1) instead of O(n)"""
-        below_threshold = (atr_rank_series < threshold).astype(int)
-        # Cumulative sum from end to find consecutive True values
-        from_end = below_threshold[::-1].cumsum()
-        return int((from_end == from_end.iloc[-1]).sum())
+        # [PATCH-10c]
+        b = (atr_rank_series < threshold).to_numpy()[::-1]
+        if len(b) == 0:
+            return 0
+        return int(len(b) if b.all() else np.argmin(b))
 
     # =====================================================
     # RANGE STRUCTURE
@@ -5532,50 +5557,50 @@ class ZacksEngine:
 # =========================================================
 
 class YahooFinanceEngine:
+    """[PATCH-7] supports both the new yfinance format (per-period analyst counts)
+    and the legacy upgrade/downgrade log; can now score bearish, not only 50..100."""
 
     @staticmethod
     def get_rating(symbol: str):
-
         try:
-
-            ticker = yf.Ticker(symbol)
-
-            rec = ticker.recommendations
-
+            rec = yf.Ticker(symbol).recommendations
             if rec is None or len(rec) == 0:
                 return {}
+            cols = {str(c).strip().lower(): c for c in rec.columns}
 
-            recent = rec.tail(20).copy()
-            normalized_cols = {str(c).strip().lower(): c for c in recent.columns}
-            grade_col = (
-                normalized_cols.get("to grade")
-                or normalized_cols.get("to_grade")
-                or normalized_cols.get("grade")
-                or normalized_cols.get("rating")
-            )
+            # new format: strongBuy / buy / hold / sell / strongSell counts per period
+            if "strongbuy" in cols and "buy" in cols:
+                r = rec.iloc[0]
+
+                def g(k):
+                    return float(r[cols[k]]) if k in cols and pd.notna(r[cols[k]]) else 0.0
+
+                sb, b, h, s, ss = g("strongbuy"), g("buy"), g("hold"), g("sell"), g("strongsell")
+                n = sb + b + h + s + ss
+                if n < 5:
+                    return {}
+                score = (sb * 100 + b * 75 + h * 50 + s * 25) / n
+                return {"score": round(score, 1), "source": "Yahoo Finance", "analysts": int(n)}
+
+            # legacy format: grade log
+            grade_col = (cols.get("to grade") or cols.get("to_grade")
+                         or cols.get("grade") or cols.get("rating"))
             if grade_col is None:
                 return {}
-
-            grades = recent[grade_col].astype(str)
-            buys = grades.str.contains(
-                "buy|strong buy|outperform|overweight",
-                case=False,
-                na=False,
-                regex=True,
-            ).sum()
-
-            score = min(100, buys * 5 + 50)
-
-            return {
-                "score": score,
-                "source": "Yahoo Finance"
-            }
+            grades = rec.tail(20)[grade_col].astype(str)
+            n = len(grades)
+            if n < 5:
+                return {}
+            pos = grades.str.contains("buy|outperform|overweight|positive",
+                                      case=False, na=False, regex=True).sum()
+            neg = grades.str.contains("sell|underperform|underweight|reduce|negative",
+                                      case=False, na=False, regex=True).sum()
+            score = float(max(0.0, min(100.0, 50.0 + 50.0 * (pos - neg) / n)))
+            return {"score": round(score, 1), "source": "Yahoo Finance"}
 
         except Exception as e:
             logger.warning(f"[{symbol}] Yahoo rating failed: {e}")
-
         return {}
-
 
 class YahooFinanceAnalystEngine(YahooFinanceEngine):
     pass
@@ -6416,8 +6441,8 @@ class CrashProtectionEngine:
 
             if rsi < 30:
                 reasons.append(f"Oversold RSI: {rsi:.1f}")
-                warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.HIGH)
-                position_adjustment *= 0.6
+                warning_level = CrashProtectionEngine._bump(warning_level, CrashProtectionEngine.MODERATE)
+                position_adjustment *= 0.85  # [PATCH-8d]
 
             if atr_expansion:
                 reasons.append("ATR expansion (high volatility)")
@@ -6539,6 +6564,15 @@ class MTFEMAEngine:
         ).dropna()
 
     @staticmethod
+    def _finish(d, tf):
+        # [PATCH-10a] '4h' is downloaded as 1h and must be resampled
+        if tf == "4h":
+            if getattr(d.index, "tz", None) is not None:
+                d = d.tz_convert("America/New_York")
+            d = MTFEMAEngine.to_4h(d)
+        return d
+
+    @staticmethod
     def download_tf(symbol: str, tf: str) -> Optional[pd.DataFrame]:
         """Download data for a specific timeframe."""
         try:
@@ -6553,12 +6587,12 @@ class MTFEMAEngine:
                 d = raw.copy()
                 d.columns = [str(c).lower() for c in d.columns]
                 if all(c in d.columns for c in ["open", "high", "low", "close"]):
-                    return d[["open", "high", "low", "close"]].dropna(subset=["close"])
+                    return MTFEMAEngine._finish(d[["open", "high", "low", "close"]].dropna(subset=["close"]), tf)
             else:
                 d = raw.xs(symbol, axis=1, level=0 if symbol in raw.columns.get_level_values(0) else 1).copy()
                 d.columns = [str(c).lower() for c in d.columns]
                 if all(c in d.columns for c in ["open", "high", "low", "close"]):
-                    return d[["open", "high", "low", "close"]].dropna(subset=["close"])
+                    return MTFEMAEngine._finish(d[["open", "high", "low", "close"]].dropna(subset=["close"]), tf)
             return None
         except Exception as e:
             logger.warning(f"[{symbol}] Failed to download {tf}: {e}")
@@ -6954,9 +6988,9 @@ class ProposalEngine:
             crash_protection = CrashProtectionEngine.assess_crash_risk(
                 market_regime=market_regime,
                 sector_rotation=sector_rotation,
-                technical_data=techs,
+                technical_data=_crash_tech(techs),  # [PATCH-8]
                 order_flow=order_flow_ctx if use_order_flow else None,
-                volume_data=breakout if breakout else None,
+                volume_data=_crash_vol(breakout),
             )
 
             # ---------------------------------------------
@@ -7432,20 +7466,21 @@ class ProposalEngine:
 
     @staticmethod
     def _breakout_snapshot(breakout: Dict[str, Any]) -> Dict[str, Any]:
-        if not breakout or breakout.get("status") == "NO_DATA":
+        # [PATCH-5] keep every field the UI / chart / thesis read
+        if not breakout or breakout.get("status") in ("NO_DATA", "INVALID_DATA", "ERROR"):
             return {}
-        return {
-            "breakout_type": breakout.get("breakout_type"),
-            "breakout_score": breakout.get("breakout_score"),
-            "confidence": breakout.get("confidence"),
-            "signal_quality": breakout.get("signal_quality"),
-            "volume_confirmed": breakout.get("volume_confirmed"),
-            "relative_volume": breakout.get("relative_volume"),
-            "squeeze_detected": breakout.get("squeeze_detected"),
-            "higher_timeframe_alignment": breakout.get("higher_timeframe_alignment"),
-            "pattern": breakout.get("pattern"),
-            "pre_breakout": breakout.get("pre_breakout"),
-        }
+        keys = (
+            "breakout_type", "breakout_score", "confidence", "signal_quality",
+            "volume_confirmed", "relative_volume", "squeeze_detected", "squeeze_duration",
+            "higher_timeframe_alignment", "pattern", "pre_breakout",
+            "range_high", "range_low", "flags", "volatility_expansion", "volume_zscore",
+            "retest_quality", "is_accumulating", "breakout_strength", "sustainability",
+            "tight_consolidation",
+        )
+        out = {k: breakout.get(k) for k in keys if k in breakout}
+        # ChartEngine reads this name
+        out["is_tight_consolidation"] = bool(breakout.get("tight_consolidation", False))
+        return out
 
     @staticmethod
     def _return_n_bars_pct(df: pd.DataFrame, bars: int = 22) -> Optional[float]:
@@ -9091,12 +9126,12 @@ def main_ui():
     # MTF EMA Settings (expanded when enabled)
     if use_mtf_ema:
         with st.sidebar.expander("MTF EMA Settings", expanded=False):
-            mtf_fast_mode = st.sidebar.checkbox(
+            mtf_fast_mode = st.checkbox(
                 "Fast Mode (stop after 2 failed TFs)",
                 value=True,
                 help="Stops scanning after 2 failed timeframes to save time. Results are identical for MATCH/WATCH."
             )
-            mtf_max_dist = st.sidebar.slider(
+            mtf_max_dist = st.slider(
                 "Max distance from EMA (%)",
                 min_value=0.0,
                 max_value=10.0,
@@ -9105,10 +9140,10 @@ def main_ui():
                 help="Maximum allowed percentage distance from EMA. 0 = disabled."
             )
 
-    # Monte Carlo Settings (expanded when enabled)
+    # Monte Carlo Settings  [PATCH-10d] (expanded when enabled)
     if use_monte_carlo:
         with st.sidebar.expander("Monte Carlo Settings", expanded=False):
-            mc_horizon = st.sidebar.slider(
+            mc_horizon = st.slider(
                 "Simulation Horizon (bars)",
                 min_value=10,
                 max_value=200,
@@ -9116,24 +9151,24 @@ def main_ui():
                 step=5,
                 help="Number of bars to simulate forward."
             )
-            mc_paths = st.sidebar.select_slider(
+            mc_paths = st.select_slider(
                 "Number of Paths",
                 options=[1000, 2000, 5000, 10000],
                 value=5000,
                 help="More paths = more accurate but slower."
             )
-            mc_include_drift = st.sidebar.checkbox(
+            mc_include_drift = st.checkbox(
                 "Include Historical Drift",
                 value=True,
                 help="Include historical drift in the simulation (mean return)."
             )
-            mc_sl_mode = st.sidebar.selectbox(
+            mc_sl_mode = st.selectbox(
                 "Stop-Loss Mode",
                 ["ATR", "Swing (10 bars)"],
                 index=0,
                 help="ATR uses ATR multiple, Swing uses 10-bar high/low."
             )
-            mc_atr_mult = st.sidebar.slider(
+            mc_atr_mult = st.slider(
                 "ATR Multiple",
                 min_value=0.5,
                 max_value=5.0,
@@ -9141,7 +9176,7 @@ def main_ui():
                 step=0.25,
                 help="ATR multiplier for stop-loss distance."
             )
-            mc_rr = st.sidebar.text_input(
+            mc_rr = st.text_input(
                 "Take-Profit in R (TP1,TP2,TP3)",
                 value="1,2,3",
                 help="Risk multiples for take-profit levels."
@@ -9194,8 +9229,7 @@ def main_ui():
         min_value=1.0,
         max_value=24.0,
         step=0.5,
-        value=float(st.session_state.auto_scan_interval_h),
-        on_change=update_interval,
+        key="auto_scan_interval_h",  # [PATCH-9d]
     )
 
     if st.session_state.get("auto_scan_enabled"):
@@ -10550,5 +10584,56 @@ class GrowthContinuityEngine:
 
 # [IQ-PATCH 9] use the fixed growth engine (statement order, reachable hard-fail, neutral on missing data)
 GrowthContinuityEngine = GrowthContinuityEngineFixed
+# =========================================================
+# [PATCH-7/8] TTL caches + crash-protection key mapping
+# =========================================================
+
+def _ttl_cache(fn, ttl: int = 3600, empty_ttl: int = 300, is_empty=lambda v: not v):
+    """Thread-safe TTL cache; empty / failed results are cached only briefly."""
+    _store: dict = {}
+    _lock = threading.Lock()
+
+    def wrapper(*args, **kwargs):
+        key = (args, tuple(sorted(kwargs.items())))
+        now = time.time()
+        with _lock:
+            hit = _store.get(key)
+            if hit and now - hit[0] < hit[2]:
+                return hit[1]
+        val = fn(*args, **kwargs)
+        life = empty_ttl if is_empty(val) else ttl
+        with _lock:
+            _store[key] = (now, val, life)
+        return val
+
+    wrapper.__wrapped__ = fn
+    return wrapper
+
+
+ZacksEngine.get_rank = staticmethod(_ttl_cache(ZacksEngine.get_rank, ttl=6 * 3600))
+AnalystConsensusEngine.get = staticmethod(_ttl_cache(
+    AnalystConsensusEngine.get, ttl=3600,
+    is_empty=lambda v: (not v) or v.get("active_sources", 1) == 0))
+
+
+def _crash_tech(techs):
+    """Map TechnicalEngine output to the keys CrashProtectionEngine actually reads."""
+    t = techs or {}
+    try:
+        rsi = float(t.get("rsi", 50) or 50)
+    except Exception:
+        rsi = 50.0
+    return {
+        "price_below_200ma": not bool(t.get("above_sma200", True)),
+        "rsi": rsi,
+        "atr_expansion": float(t.get("atr_percent", 0) or 0) > 4.5,   # tune to taste
+    }
+
+
+def _crash_vol(breakout):
+    b = breakout or {}
+    return {"obv_bearish_div": bool(b.get("obv_bearish_divergence", False))}
+
+
 if __name__ == "__main__":
     main_ui()
