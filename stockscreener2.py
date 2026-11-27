@@ -10144,7 +10144,7 @@ def main_ui():
                                 st.caption(signal)
 
                     # Sustainability check
-                    if _ba.get("sustainability", {}).get("sustained"):
+                    if (_ba.get("sustainability") or {}).get("sustained"):
                         st.success("✅ Breakout sustained with strong follow-through")
                     elif _ba.get("volatility_expansion"):
                         st.info("📈 Volatility expansion detected")
